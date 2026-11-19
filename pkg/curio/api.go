@@ -63,7 +63,7 @@ type ListResponse struct {
 	Status   Status     `json:"status"`
 }
 
-var taskKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9]{0,9}-[0-9]{1,7}$`)
+var taskKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9]{0,9}-\d{1,7}$`)
 
 // Handler returns the API handler with the loopback guard.
 func (a *API) Handler() http.Handler {
@@ -154,10 +154,10 @@ func (a *API) list(w http.ResponseWriter, r *http.Request) {
 	resp := ListResponse{Stories: []ListItem{}, Since: since, Cutoff: cfg.Cutoff, Status: a.Svc.Status(), Total: len(rows)}
 	for _, row := range rows {
 		item := a.listItem(row)
-		switch {
-		case row.Mark == MarkGood:
+		switch row.Mark {
+		case MarkGood:
 			resp.Good++
-		case row.Mark == MarkBad:
+		case MarkBad:
 			resp.Bad++
 		}
 		if item.Fit == nil {

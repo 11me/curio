@@ -51,7 +51,7 @@ func TestLoadConfig(t *testing.T) {
 	cfg, err := LoadConfig(path)
 	require.NoError(t, err)
 	assert.Equal(t, "127.0.0.1:8090", cfg.Listen)
-	assert.Equal(t, filepath.Join(dir, "var/curio"), cfg.DataDir)
+	assert.Equal(t, filepath.Join(dir, "var", "curio"), cfg.DataDir)
 	assert.Equal(t, "haiku", cfg.Claude.Model)
 	assert.Len(t, cfg.Criteria, 9)
 	assert.Equal(t, 30*time.Minute, cfg.Interval)
@@ -206,7 +206,7 @@ func TestService_Refresh(t *testing.T) {
 	require.Len(t, sc.batches, 3)
 	assert.Equal(t, []string{"Story A"}, sc.batches[2].PastPicks)
 	require.Len(t, sc.batches[2].Stories, 2)
-	assert.Equal(t, "", svc.Status().LastError)
+	assert.Empty(t, svc.Status().LastError)
 	assert.NotNil(t, svc.Status().LastRefresh)
 }
 

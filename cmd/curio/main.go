@@ -44,10 +44,10 @@ func main() {
 	log.Setup(logOpts...)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-	if err := run(ctx, o); err != nil {
+	err := run(ctx, o)
+	cancel()
+	if err != nil {
 		log.Printf("[ERROR] %v", err)
-		cancel()
 		os.Exit(1)
 	}
 }

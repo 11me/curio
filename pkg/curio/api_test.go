@@ -28,7 +28,7 @@ func newTestAPI(t *testing.T) (*Service, http.Handler) {
 	return svc, (&API{Svc: svc}).Handler()
 }
 
-func do(t *testing.T, h http.Handler, method, target, body string, hdr map[string]string) (*httptest.ResponseRecorder, map[string]any) {
+func do(t *testing.T, h http.Handler, method, target, body string, hdr map[string]string) (rec *httptest.ResponseRecorder, out map[string]any) {
 	t.Helper()
 	req := httptest.NewRequest(method, "http://127.0.0.1:8090"+target, strings.NewReader(body))
 	if method == http.MethodPost {
@@ -37,9 +37,8 @@ func do(t *testing.T, h http.Handler, method, target, body string, hdr map[strin
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
-	rec := httptest.NewRecorder()
+	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	var out map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	return rec, out
 }
