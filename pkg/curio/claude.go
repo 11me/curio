@@ -217,14 +217,20 @@ var subscriptionEnvNames = map[string]bool{
 	"LANG": true, "LC_ALL": true, "LC_CTYPE": true, "TERM": true, "XDG_CONFIG_HOME": true, "CLAUDE_CONFIG_DIR": true,
 }
 
-// subscriptionEnv keeps only subscriptionEnvNames. It refuses to run when
-// any CLAUDE_CODE_USE_* provider switch is on, because the owner then
-// expects cloud billing, and curio must not use it.
+// billingSwitches turn on cloud provider billing in the CLI.
+var billingSwitches = map[string]bool{
+	"CLAUDE_CODE_USE_BEDROCK": true, "CLAUDE_CODE_USE_VERTEX": true, "CLAUDE_CODE_USE_FOUNDRY": true,
+	"CLAUDE_CODE_USE_MANTLE": true, "CLAUDE_CODE_USE_ANTHROPIC_AWS": true,
+}
+
+// subscriptionEnv keeps only subscriptionEnvNames, so no other setting
+// reaches the CLI. It refuses to run when a billingSwitches entry is on,
+// because the owner then expects cloud billing and curio must not use it.
 func subscriptionEnv(env []string) ([]string, error) {
 	out := make([]string, 0, len(subscriptionEnvNames))
 	for _, kv := range env {
 		name, value, _ := strings.Cut(kv, "=")
-		if strings.HasPrefix(name, "CLAUDE_CODE_USE_") {
+		if billingSwitches[name] {
 			if v := strings.ToLower(strings.TrimSpace(value)); v != "" && v != "0" && v != "false" {
 				return nil, fmt.Errorf("%s is on: curio uses only the Claude subscription, not a cloud provider; unset it", name)
 			}

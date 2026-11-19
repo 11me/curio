@@ -4,6 +4,7 @@
 package curio
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -166,47 +168,111 @@ func (c Config) Validate() error {
 	return nil
 }
 
-var emptyTokenRe = regexp.MustCompile(`(?m)^api_token:[ \t]*(""|'')?[ \t]*(#.*)?$`)
-
-// EnsureAPIToken makes a random API token when the config has none. It writes
-// the new config to a 0600 temp file in the same folder and renames it over
-// the old file, so the token never sits in a file that others can read.
-// An existing config with a token gets mode 0600.
+// EnsureAPIToken makes a random API token when the config has none. It holds
+// a lock on path+".lock" so two first starts end with one token, reads the
+// file again under the lock and reuses a token saved meanwhile, sets the
+// api_token key in the parsed YAML, checks the result, and writes it through
+// a new 0600 file and a rename. An existing config with a token gets mode 0600.
 func EnsureAPIToken(path string, cfg *Config) (created bool, err error) {
 	if cfg.APIToken != "" {
-		info, err := os.Stat(path)
-		if err != nil {
-			return false, fmt.Errorf("stat config: %w", err)
-		}
-		if info.Mode().Perm()&0o077 != 0 {
-			if err := os.Chmod(path, 0o600); err != nil {
-				return false, fmt.Errorf("make config private: %w", err)
-			}
-		}
-		return false, nil
+		return false, makePrivate(path)
 	}
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // path comes from the operator
+	if err != nil {
+		return false, fmt.Errorf("token lock: %w", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil { //nolint:gosec // fd fits in int
+		return false, fmt.Errorf("token lock: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }() //nolint:gosec // fd fits in int
+
+	data, err := os.ReadFile(path) //nolint:gosec // path comes from the operator
+	if err != nil {
+		return false, fmt.Errorf("read config: %w", err)
+	}
+	var saved struct {
+		APIToken string `yaml:"api_token"`
+	}
+	if err := yaml.Unmarshal(data, &saved); err != nil {
+		return false, fmt.Errorf("parse config: %w", err)
+	}
+	if saved.APIToken != "" {
+		cfg.APIToken = saved.APIToken
+		return false, makePrivate(path)
+	}
+
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return false, fmt.Errorf("make token: %w", err)
 	}
 	token := hex.EncodeToString(buf)
-	old, err := os.ReadFile(path) //nolint:gosec // path comes from the operator
+	updated, err := setTokenYAML(data, token)
 	if err != nil {
-		return false, fmt.Errorf("read config: %w", err)
+		return false, err
 	}
-	entry := "api_token: " + token
-	var updated string
-	if emptyTokenRe.Match(old) {
-		updated = emptyTokenRe.ReplaceAllLiteralString(string(old), entry)
-	} else {
-		updated = strings.TrimRight(string(old), "\n") +
-			"\n\n# API token for the bb plugin, made by curio. Keep this file private.\n" + entry + "\n"
-	}
-	if err := writePrivate(path, []byte(updated)); err != nil {
+	if err := writePrivate(path, updated); err != nil {
 		return false, err
 	}
 	cfg.APIToken = token
 	return true, nil
+}
+
+// setTokenYAML sets api_token in a YAML document and checks that the result
+// parses with that token.
+func setTokenYAML(data []byte, token string) ([]byte, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("config is not a YAML mapping")
+	}
+	root := doc.Content[0]
+	value := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: token}
+	found := false
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == "api_token" {
+			value.LineComment = root.Content[i+1].LineComment
+			root.Content[i+1] = value
+			found = true
+		}
+	}
+	if !found {
+		key := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "api_token",
+			HeadComment: "API token for the bb plugin, made by curio. Keep this file private."}
+		root.Content = append(root.Content, key, value)
+	}
+	var out bytes.Buffer
+	enc := yaml.NewEncoder(&out)
+	enc.SetIndent(2)
+	if err := enc.Encode(&doc); err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
+	}
+	var check Config
+	if err := yaml.Unmarshal(out.Bytes(), &check); err != nil {
+		return nil, fmt.Errorf("the updated config does not read back; it was not saved: %w", err)
+	}
+	if check.APIToken != token {
+		return nil, fmt.Errorf("the updated config has another api_token; it was not saved")
+	}
+	return out.Bytes(), nil
+}
+
+func makePrivate(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat config: %w", err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return fmt.Errorf("make config private: %w", err)
+		}
+	}
+	return nil
 }
 
 // writePrivate replaces path with data through a new 0600 file and a rename.

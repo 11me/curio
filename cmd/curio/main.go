@@ -73,6 +73,11 @@ func run(ctx context.Context, o opts) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return fmt.Errorf("data folder: %w", err)
 	}
+	runLock, err := curio.AcquireRunLock(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer runLock.Close()
 	store, err := curio.OpenStore(ctx, filepath.Join(cfg.DataDir, "curio.db"))
 	if err != nil {
 		return err

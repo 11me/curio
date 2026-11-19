@@ -31,8 +31,11 @@ In addition to intelligent feed curation, newscope provides:
 ## curio
 
 curio runs on your own computer. It serves its API only on the Unix socket
-`~/.curio/curio.sock` (setting `socket`). curio keeps the socket folder at mode
-0700 and the socket at 0600, so other users cannot reach it.
+`~/.curio/curio.sock` (setting `socket`), with the socket at mode 0600. The
+socket folder must be yours with mode 0700, and no folder above it may be
+writable by other users; curio makes a missing folder but never changes an
+existing one. It replaces an old socket only when nothing listens on it. Only
+one curio (the service or `--once`) runs with a data folder at a time.
 
 1. Install the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) and log in once with `claude`.
 2. Copy `curio.example.yml` to `curio.yml` and change the criteria if you want.
@@ -48,9 +51,11 @@ Each refresh reads the front page (`front_n` stories), gets the article text,
 and sends new stories to the model in batches (`claude.batch_size` stories in
 one call). Known stories only get new points and comment counts.
 
-On the first run curio adds a random `api_token` to `curio.yml`. It writes
-the new config to a 0600 temp file and renames it over the old one, so the
-token is never in a file that others can read. Paste the token once into the
+On the first run curio sets a random `api_token` in `curio.yml` (also when
+the key is empty or null). It takes a lock so two first starts make one token,
+checks that the new file reads back, and writes it to a 0600 temp file that
+it renames over the old one, so the token is never in a file that others can
+read. The rewrite keeps your settings and comments but may change spacing. Paste the token once into the
 masked field bb Settings > Plugins > curio > curio API token. Do not put it on
 a command line: the shell keeps it in its history.
 
@@ -66,8 +71,9 @@ day in one database transaction, so a second curio process (for example
 
 The CLI gets only the variables that a subscription login needs (`HOME`,
 `USER`, `PATH`, `TMPDIR`, locale and a few more). API keys, endpoints and cloud
-account variables stay out. curio refuses to run when any
-`CLAUDE_CODE_USE_*` provider switch is on.
+account variables stay out. curio refuses to run when a cloud billing switch
+is on (`CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_MANTLE`,
+`_ANTHROPIC_AWS`).
 
 ### Article text
 

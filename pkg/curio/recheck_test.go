@@ -70,9 +70,13 @@ func TestEnsureAPIToken_ReplacesEmptyEntry(t *testing.T) {
 	assert.Equal(t, cfg.APIToken, again.APIToken)
 }
 
-func shortTempDir(t *testing.T) string {
+// privateTempDir is a folder whose ancestors other users cannot change: a
+// folder under the home folder (not /tmp, which every user can write).
+func privateTempDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "cs")
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
+	dir, err := os.MkdirTemp(home, ".curio-test-")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
@@ -80,16 +84,13 @@ func shortTempDir(t *testing.T) string {
 
 // Re-check 1, finding 2: curio serves on a socket in a folder only the owner can open.
 func TestListenSocket(t *testing.T) {
-	base := shortTempDir(t)
-	dir := filepath.Join(base, "run")
-	require.NoError(t, os.Mkdir(dir, 0o755))
-	path := filepath.Join(dir, "curio.sock")
+	path := filepath.Join(privateTempDir(t), "run", "curio.sock")
 
 	ln, err := ListenSocket(path)
 	require.NoError(t, err)
-	info, err := os.Stat(dir)
+	info, err := os.Stat(filepath.Dir(path))
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(), "the folder is private")
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(), "a new folder is private")
 	sock, err := os.Lstat(path)
 	require.NoError(t, err)
 	assert.NotZero(t, sock.Mode()&os.ModeSocket)
@@ -254,7 +255,7 @@ func TestSubscriptionEnv_Allowlist(t *testing.T) {
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"PATH=/bin", "HOME=/h", "USER=me", "TMPDIR=/t", "LANG=en_US.UTF-8"}, env)
 
-	for _, kv := range []string{"CLAUDE_CODE_USE_MANTLE=1", "CLAUDE_CODE_USE_ANTHROPIC_AWS=1", "CLAUDE_CODE_USE_SOMETHING_NEW=yes"} {
+	for _, kv := range []string{"CLAUDE_CODE_USE_MANTLE=1", "CLAUDE_CODE_USE_ANTHROPIC_AWS=1", "CLAUDE_CODE_USE_VERTEX=yes"} {
 		_, err := subscriptionEnv([]string{"PATH=/bin", kv})
 		require.Error(t, err, kv)
 	}
