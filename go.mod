@@ -14,7 +14,7 @@ require (
 	github.com/markusmobius/go-trafilatura v1.12.2
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/mmcdole/gofeed v1.3.0
-	github.com/sashabaranov/go-openai v1.41.2
+	github.com/sashabaranov/go-openai v1.43.0
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/net v0.47.0
 	golang.org/x/sync v0.18.0
