@@ -38,8 +38,13 @@ type RunLock struct {
 	f   *os.File
 }
 
-// AcquireRunLock takes the data folder lock without waiting.
+// AcquireRunLock checks the data folder with CheckDataDir and then takes
+// its lock without waiting. The lock file is the first file any curio run
+// opens in the data folder, so no run (service or --once) uses an unsafe one.
 func AcquireRunLock(dataDir string) (*RunLock, error) {
+	if err := CheckDataDir(dataDir); err != nil {
+		return nil, err
+	}
 	f, err := os.OpenFile(filepath.Join(dataDir, "curio.lock"), os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // data folder from the operator
 	if err != nil {
 		return nil, fmt.Errorf("run lock: %w", err)
@@ -57,27 +62,19 @@ func AcquireRunLock(dataDir string) (*RunLock, error) {
 // Close releases the lock.
 func (l *RunLock) Close() error { return l.f.Close() }
 
-// Listen serves on SocketPath of the locked data folder. The data folder must
-// be inside the home folder; every folder from the home folder down to the
-// socket folder must belong to this user, give no write access to group or
-// others, and have no ACL entry that allows anything. curio makes the socket
+// Listen serves on SocketPath of the locked data folder. It checks the data
+// folder again (CheckDataDir) and the socket folder with the same rules, and
+// the socket folder must have mode 0700. curio makes the socket
 // folder (mode 0700) when it is missing and never changes an existing one. An
 // old socket is removed only here, while the data folder lock is held, so no
 // other curio can be serving on it.
 func (l *RunLock) Listen() (net.Listener, error) {
+	if err := CheckDataDir(l.dir); err != nil {
+		return nil, err
+	}
 	dataDir, err := filepath.EvalSymlinks(l.dir)
 	if err != nil {
 		return nil, fmt.Errorf("data folder: %w", err)
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("home folder: %w", err)
-	}
-	if home, err = filepath.EvalSymlinks(home); err != nil {
-		return nil, fmt.Errorf("home folder: %w", err)
-	}
-	if dataDir == home || !strings.HasPrefix(dataDir, home+string(filepath.Separator)) {
-		return nil, fmt.Errorf("data folder %s must be inside your home folder %s", dataDir, home)
 	}
 	sockDir := filepath.Dir(SocketPath(dataDir))
 	if _, err := os.Lstat(sockDir); errors.Is(err, os.ErrNotExist) {
@@ -92,13 +89,8 @@ func (l *RunLock) Listen() (net.Listener, error) {
 	if !info.IsDir() || info.Mode().Perm() != 0o700 {
 		return nil, fmt.Errorf("socket folder %s must be a folder with mode 0700; curio does not change it", sockDir)
 	}
-	for d := sockDir; ; d = filepath.Dir(d) {
-		if err := checkFolder(d); err != nil {
-			return nil, err
-		}
-		if d == home {
-			break
-		}
+	if err := checkFolder(sockDir); err != nil {
+		return nil, err
 	}
 	path := SocketPath(dataDir)
 	if len(path) > 100 {
@@ -123,6 +115,47 @@ func (l *RunLock) Listen() (net.Listener, error) {
 	return ln, nil
 }
 
+// CheckDataDir refuses a data folder that is not inside the home folder, or
+// when a folder from the data folder up to the home folder belongs to another
+// user, lets group or other users write, or has an ACL entry that allows
+// access. Then no other user can replace the database, the lock or the socket.
+func CheckDataDir(dataDir string) error {
+	if !filepath.IsAbs(dataDir) {
+		return fmt.Errorf("data folder %s must be an absolute path", dataDir)
+	}
+	resolved, err := filepath.EvalSymlinks(dataDir)
+	if err != nil {
+		return fmt.Errorf("data folder: %w", err)
+	}
+	home, err := realHome()
+	if err != nil {
+		return err
+	}
+	if resolved == home || !strings.HasPrefix(resolved, home+string(filepath.Separator)) {
+		return fmt.Errorf("data folder %s must be inside your home folder %s", resolved, home)
+	}
+	for d := resolved; ; d = filepath.Dir(d) {
+		if err := checkFolder(d); err != nil {
+			return err
+		}
+		if d == home {
+			return nil
+		}
+	}
+}
+
+func realHome() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("home folder: %w", err)
+	}
+	home, err = filepath.EvalSymlinks(home)
+	if err != nil {
+		return "", fmt.Errorf("home folder: %w", err)
+	}
+	return home, nil
+}
+
 // checkFolder refuses a folder that another user could change.
 func checkFolder(dir string) error {
 	info, err := os.Lstat(dir)
@@ -130,14 +163,14 @@ func checkFolder(dir string) error {
 		return fmt.Errorf("check %s: %w", dir, err)
 	}
 	if !info.IsDir() || !ownedByMe(info) || info.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("socket path is not safe: %s is not your own folder closed to writes by other users", dir)
+		return fmt.Errorf("folder %s is not safe: it is not your own folder closed to writes by other users", dir)
 	}
 	allow, err := hasAllowACL(dir)
 	if err != nil {
 		return err
 	}
 	if allow {
-		return fmt.Errorf("socket path is not safe: %s has an ACL entry that allows access", dir)
+		return fmt.Errorf("folder %s is not safe: it has an ACL entry that allows access", dir)
 	}
 	return nil
 }

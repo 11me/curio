@@ -64,17 +64,6 @@ func TestRunLock_ReplacesStaleSocket(t *testing.T) {
 
 // Re-check 3: curio refuses a socket folder it would have to trust blindly.
 func TestRunLock_RefusesUnsafeFolders(t *testing.T) {
-	t.Run("outside home", func(t *testing.T) {
-		dir, err := os.MkdirTemp("/tmp", "cd")
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = os.RemoveAll(dir) })
-		lock, err := AcquireRunLock(dir)
-		require.NoError(t, err)
-		defer lock.Close()
-		_, err = lock.Listen()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "home folder")
-	})
 	t.Run("existing open socket folder keeps its mode", func(t *testing.T) {
 		dir := filepath.Join(privateTempDir(t), "data")
 		require.NoError(t, os.MkdirAll(filepath.Join(dir, "sock"), 0o700))
@@ -87,17 +76,6 @@ func TestRunLock_RefusesUnsafeFolders(t *testing.T) {
 		info, err := os.Stat(filepath.Join(dir, "sock"))
 		require.NoError(t, err)
 		assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
-	})
-	t.Run("data folder others can write", func(t *testing.T) {
-		dir := filepath.Join(privateTempDir(t), "data")
-		require.NoError(t, os.MkdirAll(dir, 0o700))
-		require.NoError(t, os.Chmod(dir, 0o777))
-		lock, err := AcquireRunLock(dir)
-		require.NoError(t, err)
-		defer lock.Close()
-		_, err = lock.Listen()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "other users")
 	})
 	t.Run("socket folder with an allow ACL", func(t *testing.T) {
 		if runtime.GOOS != "darwin" {

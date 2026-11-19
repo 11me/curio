@@ -31,7 +31,10 @@ In addition to intelligent feed curation, newscope provides:
 ## curio
 
 curio runs on your own computer. Its data folder (`data_dir`, default
-`~/.curio`) must be inside your home folder. It holds the database, a run
+`~/.curio`; a relative path is relative to the config file) must be inside
+your home folder. Every run (the service and `--once`) checks the data folder
+and the folders above it up to your home folder before it opens any file
+there. It holds the database, a run
 lock and the API socket `sock/curio.sock`; there is no other API address and
 no socket setting. Only one curio (the service or `--once`) runs with a data
 folder at a time. curio makes the `sock` folder with mode 0700 and never

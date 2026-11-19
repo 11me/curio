@@ -107,6 +107,9 @@ func LoadConfig(path string) (Config, error) {
 	if !filepath.IsAbs(cfg.DataDir) {
 		cfg.DataDir = filepath.Join(filepath.Dir(path), cfg.DataDir)
 	}
+	if cfg.DataDir, err = filepath.Abs(cfg.DataDir); err != nil {
+		return cfg, fmt.Errorf("data_dir: %w", err)
+	}
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}

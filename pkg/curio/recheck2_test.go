@@ -70,7 +70,7 @@ func TestEnsureAPIToken_TwoFirstStarts(t *testing.T) {
 
 // Re-check 2, finding 6: only one curio process runs and scores at a time.
 func TestRunLock(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateTempDir(t)
 	first, err := AcquireRunLock(dir)
 	require.NoError(t, err)
 	_, err = AcquireRunLock(dir)
