@@ -83,6 +83,8 @@ func run(ctx context.Context, o opts) error {
 		return err
 	}
 	defer runLock.Close()
+	// only the checked, resolved data folder from here on
+	cfg.DataDir = runLock.Dir()
 	store, err := curio.OpenStore(ctx, filepath.Join(cfg.DataDir, "curio.db"))
 	if err != nil {
 		return err

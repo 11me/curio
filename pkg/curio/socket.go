@@ -38,14 +38,15 @@ type RunLock struct {
 	f   *os.File
 }
 
-// AcquireRunLock checks the data folder with CheckDataDir and then takes
-// its lock without waiting. The lock file is the first file any curio run
+// AcquireRunLock resolves and checks the data folder with ResolveDataDir and
+// then takes its lock, in the resolved folder, without waiting. The lock file is the first file any curio run
 // opens in the data folder, so no run (service or --once) uses an unsafe one.
 func AcquireRunLock(dataDir string) (*RunLock, error) {
-	if err := CheckDataDir(dataDir); err != nil {
+	resolved, err := ResolveDataDir(dataDir)
+	if err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(dataDir, "curio.lock"), os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // data folder from the operator
+	f, err := os.OpenFile(filepath.Join(resolved, "curio.lock"), os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // checked data folder
 	if err != nil {
 		return nil, fmt.Errorf("run lock: %w", err)
 	}
@@ -56,25 +57,30 @@ func AcquireRunLock(dataDir string) (*RunLock, error) {
 		}
 		return nil, fmt.Errorf("run lock: %w", err)
 	}
-	return &RunLock{dir: dataDir, f: f}, nil
+	return &RunLock{dir: resolved, f: f}, nil
 }
+
+// Dir is the checked, resolved data folder. Use only this path for files in
+// the data folder: it has no symlinks that could be changed after the check.
+func (l *RunLock) Dir() string { return l.dir }
 
 // Close releases the lock.
 func (l *RunLock) Close() error { return l.f.Close() }
 
 // Listen serves on SocketPath of the locked data folder. It checks the data
-// folder again (CheckDataDir) and the socket folder with the same rules, and
+// folder again (ResolveDataDir) and the socket folder with the same rules, and
 // the socket folder must have mode 0700. curio makes the socket
 // folder (mode 0700) when it is missing and never changes an existing one. An
 // old socket is removed only here, while the data folder lock is held, so no
 // other curio can be serving on it.
 func (l *RunLock) Listen() (net.Listener, error) {
-	if err := CheckDataDir(l.dir); err != nil {
+	// l.dir is resolved; a folder on it that became a symlink resolves elsewhere
+	dataDir, err := ResolveDataDir(l.dir)
+	if err != nil {
 		return nil, err
 	}
-	dataDir, err := filepath.EvalSymlinks(l.dir)
-	if err != nil {
-		return nil, fmt.Errorf("data folder: %w", err)
+	if dataDir != l.dir {
+		return nil, fmt.Errorf("data folder %s changed after the check", l.dir)
 	}
 	sockDir := filepath.Dir(SocketPath(dataDir))
 	if _, err := os.Lstat(sockDir); errors.Is(err, os.ErrNotExist) {
@@ -115,31 +121,34 @@ func (l *RunLock) Listen() (net.Listener, error) {
 	return ln, nil
 }
 
-// CheckDataDir refuses a data folder that is not inside the home folder, or
-// when a folder from the data folder up to the home folder belongs to another
-// user, lets group or other users write, or has an ACL entry that allows
-// access. Then no other user can replace the database, the lock or the socket.
-func CheckDataDir(dataDir string) error {
-	if !filepath.IsAbs(dataDir) {
-		return fmt.Errorf("data folder %s must be an absolute path", dataDir)
-	}
-	resolved, err := filepath.EvalSymlinks(dataDir)
+// ResolveDataDir makes the data folder absolute, resolves its symlinks once,
+// checks the resolved path and returns it. It refuses a folder that is not
+// inside the home folder, or when a folder from the data folder up to the
+// home folder belongs to another user, lets group or other users write, or
+// has an ACL entry that allows access. Then no other user can replace the
+// database, the lock or the socket.
+func ResolveDataDir(dataDir string) (string, error) {
+	abs, err := filepath.Abs(dataDir)
 	if err != nil {
-		return fmt.Errorf("data folder: %w", err)
+		return "", fmt.Errorf("data folder: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("data folder: %w", err)
 	}
 	home, err := realHome()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if resolved == home || !strings.HasPrefix(resolved, home+string(filepath.Separator)) {
-		return fmt.Errorf("data folder %s must be inside your home folder %s", resolved, home)
+		return "", fmt.Errorf("data folder %s must be inside your home folder %s", resolved, home)
 	}
 	for d := resolved; ; d = filepath.Dir(d) {
 		if err := checkFolder(d); err != nil {
-			return err
+			return "", err
 		}
 		if d == home {
-			return nil
+			return resolved, nil
 		}
 	}
 }
