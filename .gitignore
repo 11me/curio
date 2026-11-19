@@ -52,3 +52,8 @@ var/
 .claude/
 
 # Generated files.serena/
+
+# curio local config and data
+/curio.yml
+/curio
+/curio.yml.lock

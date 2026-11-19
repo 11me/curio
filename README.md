@@ -1,3 +1,10 @@
+> **curio** is a personal copy of newscope. It adds a Hacker News curator:
+> `cmd/curio` reads the front page with points and comments, scores each story
+> against weighted yes/no criteria with the `claude` CLI (your Claude login, no
+> API key), and serves a small JSON API on a private Unix socket for a bb plugin view.
+> See [curio](#curio) below and [UPSTREAM.md](UPSTREAM.md). Everything else in
+> this README is newscope and works as before.
+
 <div align="center">
   <img src="server/static/img/full-logo.svg" alt="Newscope" width="425">
   <br>
@@ -20,6 +27,93 @@ In addition to intelligent feed curation, newscope provides:
 - Modern web UI with multiple view modes
 - Real-time feed updates
 - Full-text search with partial word matching
+
+## curio
+
+curio runs on your own computer. Its data folder (`data_dir`, default
+`~/.curio`; a relative path is relative to the config file) must be inside
+your home folder. Every run (the service and `--once`) checks the data folder
+and the folders above it up to your home folder before it opens any file
+there. It holds the database, a run
+lock and the API socket `sock/curio.sock`; there is no other API address and
+no socket setting. Only one curio (the service or `--once`) runs with a data
+folder at a time. curio makes the `sock` folder with mode 0700 and never
+changes an existing one. It refuses to start when a folder from your home
+folder down to `sock` belongs to another user, lets group or other users
+write, or has an ACL entry that allows access. It removes an old socket only
+while it holds the data folder lock.
+
+1. Install the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) and log in once with `claude`.
+2. Copy `curio.example.yml` to `curio.yml` and change the criteria if you want.
+3. Run it:
+
+   ```sh
+   go run ./cmd/curio -c curio.yml            # server on ~/.curio/sock/curio.sock
+   go run ./cmd/curio -c curio.yml --once     # one refresh, then exit
+   go run ./cmd/curio -c curio.yml --data ~/curio-test   # other data folder (in your home)
+   ```
+
+Each refresh reads the front page (`front_n` stories), gets the article text,
+and sends new stories to the model in batches (`claude.batch_size` stories in
+one call). Known stories only get new points and comment counts.
+
+On the first run curio sets a random `api_token` in `curio.yml` (also when
+the key is empty or null). It refuses a config with more than one YAML
+document and leaves it unchanged. It takes a lock so two first starts make one token,
+checks that the new file reads back, and writes it to a 0600 temp file that
+it renames over the old one, so the token is never in a file that others can
+read. The rewrite keeps your settings and comments but may change spacing. Paste the token once into the
+masked field bb Settings > Plugins > curio > curio API token. Do not put it on
+a command line: the shell keeps it in its history.
+
+### Limits
+
+`limits` in `curio.yml` caps the use of your subscription: `daily_calls` and
+`daily_stories` per UTC day, `min_refresh` between two refresh starts (for the
+schedule and for Refresh now), and `retry_after` before a failed story is sent
+again. Each batch takes its call and stories from the allowance of its own UTC
+day in one database transaction, so a second curio process (for example
+`--once`) cannot go over the limits. Each CLI call also has
+`claude.max_turns` and `claude.max_budget_usd`.
+
+The CLI gets only the variables that a subscription login needs (`HOME`,
+`USER`, `PATH`, `TMPDIR`, locale and a few more). API keys, endpoints and cloud
+account variables stay out. curio refuses to run when a cloud billing switch
+is on (`CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_MANTLE`,
+`_ANTHROPIC_AWS`).
+
+### Article text
+
+curio fetches article text only over http and https, from public addresses.
+It resolves each host itself and refuses loopback, private, link-local (cloud
+metadata), carrier NAT, multicast and other special addresses, and every
+address of this computer itself, also after redirects. If a host has several
+public addresses, curio tries them in turn. It reads at most 3 MB in 30 seconds and does not use a proxy. Only
+the extracted text of a public page goes to the model.
+
+### Fit
+
+For each criterion the model answers how likely the answer is yes (0 to 1) and
+gives a short reason. The fit is `1 / (1 + e^-(bias + sum(weight * answer)))`.
+Weights and bias come from `curio.yml` and apply at read time, so a change
+needs only a restart, not a new scoring run. Stories you mark Good or Bad go
+into later prompts as `past_picks` and `past_rejects`.
+
+### API
+
+| Method | Path | Body or query |
+| --- | --- | --- |
+| GET | `/api/v1/stories` | `min_fit` (0 to 1), `q`, `sort` (`fit`, `date`, `points`), `marks` (`all`, `hide`, `good`, `bad`), `limit` |
+| GET | `/api/v1/stories/{id}` | Summary, the top three reasons and all criteria rows |
+| POST | `/api/v1/stories/{id}/mark` | `{"mark":"good"}`, `"bad"` or `"none"` |
+| POST | `/api/v1/stories/{id}/task` | `{"key":"PER-12"}` records a task made from the story |
+| POST | `/api/v1/refresh` | `{}` starts a refresh; 429 within `min_refresh` |
+| GET | `/api/v1/status` | Refresh state |
+
+The API is on the Unix socket only. Every call needs
+`Authorization: Bearer <api_token>`. The API also refuses a non-loopback
+`Host`, any `Origin` header, and POST bodies that are not JSON. Writes are
+POST only.
 
 ## Basic Usage
 
