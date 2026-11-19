@@ -3,18 +3,20 @@ package curio
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
-	"time"
 )
 
-// DefaultSocket is the API socket path. Its folder is private to the owner,
-// so only the owner's processes can serve or call the API there.
-const DefaultSocket = "~/.curio/curio.sock"
+// SocketPath is the one API socket of a data folder. Two data folders never
+// share a socket, and its folder is made by curio itself.
+func SocketPath(dataDir string) string {
+	return filepath.Join(dataDir, "sock", "curio.sock")
+}
 
 // ExpandHome turns a leading "~/" into the home folder.
 func ExpandHome(path string) (string, error) {
@@ -28,29 +30,87 @@ func ExpandHome(path string) (string, error) {
 	return filepath.Join(home, strings.TrimPrefix(path, "~")), nil
 }
 
-// ListenSocket listens on a Unix socket whose folder belongs to this user
-// with mode 0700 and whose parent folders other users cannot change, so no
-// other user can serve or swap a socket at that path. curio makes a missing
-// folder (mode 0700) but never changes the mode of an existing one. It
-// replaces a stale curio socket only when nothing listens on it.
-func ListenSocket(path string) (net.Listener, error) {
-	path, err := ExpandHome(path)
+// RunLock is an exclusive lock on dataDir/curio.lock for the life of the
+// process: only one curio (service or --once) fetches, scores and serves with
+// a data folder at a time.
+type RunLock struct {
+	dir string
+	f   *os.File
+}
+
+// AcquireRunLock takes the data folder lock without waiting.
+func AcquireRunLock(dataDir string) (*RunLock, error) {
+	f, err := os.OpenFile(filepath.Join(dataDir, "curio.lock"), os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // data folder from the operator
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("run lock: %w", err)
 	}
-	if !filepath.IsAbs(path) {
-		return nil, fmt.Errorf("socket %q: use an absolute path", path)
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil { //nolint:gosec // fd fits in int
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("another curio is running with the data folder %s", dataDir)
+		}
+		return nil, fmt.Errorf("run lock: %w", err)
 	}
-	dir, err := privateSocketDir(filepath.Dir(path))
+	return &RunLock{dir: dataDir, f: f}, nil
+}
+
+// Close releases the lock.
+func (l *RunLock) Close() error { return l.f.Close() }
+
+// Listen serves on SocketPath of the locked data folder. The data folder must
+// be inside the home folder; every folder from the home folder down to the
+// socket folder must belong to this user, give no write access to group or
+// others, and have no ACL entry that allows anything. curio makes the socket
+// folder (mode 0700) when it is missing and never changes an existing one. An
+// old socket is removed only here, while the data folder lock is held, so no
+// other curio can be serving on it.
+func (l *RunLock) Listen() (net.Listener, error) {
+	dataDir, err := filepath.EvalSymlinks(l.dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("data folder: %w", err)
 	}
-	path = filepath.Join(dir, filepath.Base(path))
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("home folder: %w", err)
+	}
+	if home, err = filepath.EvalSymlinks(home); err != nil {
+		return nil, fmt.Errorf("home folder: %w", err)
+	}
+	if dataDir == home || !strings.HasPrefix(dataDir, home+string(filepath.Separator)) {
+		return nil, fmt.Errorf("data folder %s must be inside your home folder %s", dataDir, home)
+	}
+	sockDir := filepath.Dir(SocketPath(dataDir))
+	if _, err := os.Lstat(sockDir); errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(sockDir, 0o700); err != nil {
+			return nil, fmt.Errorf("make socket folder: %w", err)
+		}
+	}
+	info, err := os.Lstat(sockDir)
+	if err != nil {
+		return nil, fmt.Errorf("socket folder: %w", err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+		return nil, fmt.Errorf("socket folder %s must be a folder with mode 0700; curio does not change it", sockDir)
+	}
+	for d := sockDir; ; d = filepath.Dir(d) {
+		if err := checkFolder(d); err != nil {
+			return nil, err
+		}
+		if d == home {
+			break
+		}
+	}
+	path := SocketPath(dataDir)
 	if len(path) > 100 {
-		return nil, fmt.Errorf("socket %q: path is too long for a Unix socket", path)
+		return nil, fmt.Errorf("socket %s: path is too long for a Unix socket; use a shorter data folder", path)
 	}
-	if err := removeStaleSocket(path); err != nil {
-		return nil, err
+	if old, err := os.Lstat(path); err == nil {
+		if old.Mode()&os.ModeSocket == 0 || !ownedByMe(old) {
+			return nil, fmt.Errorf("%s exists and is not a curio socket", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("remove old socket: %w", err)
+		}
 	}
 	ln, err := net.Listen("unix", path)
 	if err != nil {
@@ -63,107 +123,51 @@ func ListenSocket(path string) (net.Listener, error) {
 	return ln, nil
 }
 
-// privateSocketDir checks (and if missing, makes) the socket folder and
-// returns its real path.
-func privateSocketDir(dir string) (string, error) {
-	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
-		parent, err := filepath.EvalSymlinks(filepath.Dir(dir))
-		if err != nil {
-			return "", fmt.Errorf("socket folder parent: %w", err)
-		}
-		if err := checkAncestors(parent); err != nil {
-			return "", err
-		}
-		if err := os.Mkdir(filepath.Join(parent, filepath.Base(dir)), 0o700); err != nil {
-			return "", fmt.Errorf("make socket folder: %w", err)
-		}
-	}
-	realDir, err := filepath.EvalSymlinks(dir)
+// checkFolder refuses a folder that another user could change.
+func checkFolder(dir string) error {
+	info, err := os.Lstat(dir)
 	if err != nil {
-		return "", fmt.Errorf("socket folder: %w", err)
+		return fmt.Errorf("check %s: %w", dir, err)
 	}
-	info, err := os.Lstat(realDir)
+	if !info.IsDir() || !ownedByMe(info) || info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("socket path is not safe: %s is not your own folder closed to writes by other users", dir)
+	}
+	allow, err := hasAllowACL(dir)
 	if err != nil {
-		return "", fmt.Errorf("socket folder: %w", err)
+		return err
 	}
-	if !info.IsDir() || !ownedByMe(info) || info.Mode().Perm() != 0o700 {
-		return "", fmt.Errorf("socket folder %s must be a folder owned by you with mode 0700; curio does not change it", realDir)
-	}
-	if err := checkAncestors(filepath.Dir(realDir)); err != nil {
-		return "", err
-	}
-	return realDir, nil
-}
-
-// checkAncestors refuses a path when any folder on it belongs to another
-// user (not root) or lets group or other users write, because such a user
-// could rename a folder and put a different socket at the same path.
-func checkAncestors(dir string) error {
-	for d := dir; ; d = filepath.Dir(d) {
-		info, err := os.Lstat(d)
-		if err != nil {
-			return fmt.Errorf("check %s: %w", d, err)
-		}
-		st, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return fmt.Errorf("check %s: no owner information", d)
-		}
-		if (int(st.Uid) != os.Getuid() && st.Uid != 0) || info.Mode().Perm()&0o022 != 0 {
-			return fmt.Errorf("socket path is not safe: other users can change %s; use a folder in your home", d)
-		}
-		if d == filepath.Dir(d) {
-			return nil
-		}
-	}
-}
-
-// removeStaleSocket deletes path only when it is this user's stream socket
-// with no listener (connection refused). A live socket, a socket of another
-// type and any other file stay.
-func removeStaleSocket(path string) error {
-	old, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("socket: %w", err)
-	}
-	if old.Mode()&os.ModeSocket == 0 || !ownedByMe(old) {
-		return fmt.Errorf("%s exists and is not a curio socket", path)
-	}
-	conn, err := net.DialTimeout("unix", path, time.Second)
-	if err == nil {
-		_ = conn.Close()
-		return fmt.Errorf("another curio is already serving on %s", path)
-	}
-	if !errors.Is(err, syscall.ECONNREFUSED) {
-		return fmt.Errorf("%s is in use by another program: %w", path, err)
-	}
-	if err := os.Remove(path); err != nil {
-		return fmt.Errorf("remove stale socket: %w", err)
+	if allow {
+		return fmt.Errorf("socket path is not safe: %s has an ACL entry that allows access", dir)
 	}
 	return nil
+}
+
+// hasAllowACL reports an ACL entry that allows access. On macOS "ls -led"
+// lists entries as "N: subject allow|deny rights"; deny entries (such as the
+// home folder's "everyone deny delete") take nothing away from the owner and
+// are fine. Elsewhere a "+" after the mode means a POSIX ACL.
+func hasAllowACL(dir string) (bool, error) {
+	if runtime.GOOS == "darwin" {
+		out, err := exec.Command("/bin/ls", "-led", dir).Output() //nolint:gosec // fixed binary, path argument
+		if err != nil {
+			return false, fmt.Errorf("read ACL of %s: %w", dir, err)
+		}
+		for _, line := range strings.Split(string(out), "\n")[1:] {
+			if strings.Contains(line, " allow ") {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	out, err := exec.Command("ls", "-ld", dir).Output() //nolint:gosec // path argument
+	if err != nil {
+		return false, fmt.Errorf("read ACL of %s: %w", dir, err)
+	}
+	mode := strings.Fields(string(out))
+	return len(mode) > 0 && len(mode[0]) > 10 && mode[0][10] == '+', nil
 }
 
 func ownedByMe(info os.FileInfo) bool {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	return ok && int(st.Uid) == os.Getuid()
-}
-
-// AcquireRunLock takes an exclusive lock on dataDir/curio.lock for the life
-// of the process, so only one curio (service or --once) fetches and scores
-// with a data folder at a time.
-func AcquireRunLock(dataDir string) (io.Closer, error) {
-	f, err := os.OpenFile(filepath.Join(dataDir, "curio.lock"), os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // data folder from the operator
-	if err != nil {
-		return nil, fmt.Errorf("run lock: %w", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil { //nolint:gosec // fd fits in int
-		_ = f.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, fmt.Errorf("another curio is running with the data folder %s", dataDir)
-		}
-		return nil, fmt.Errorf("run lock: %w", err)
-	}
-	return f, nil
 }

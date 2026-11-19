@@ -7,11 +7,12 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"syscall"
 	"time"
 
@@ -20,7 +21,6 @@ import (
 
 // Config is the curio configuration file.
 type Config struct {
-	Socket   string        `yaml:"socket"`    // Unix socket of the API, in a folder only the owner can open
 	DataDir  string        `yaml:"data_dir"`  // folder for the SQLite database
 	Interval time.Duration `yaml:"interval"`  // time between front page refreshes
 	FrontN   int           `yaml:"front_n"`   // number of front page stories to read
@@ -69,8 +69,7 @@ var idRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,39}$`)
 // DefaultConfig returns the built-in defaults.
 func DefaultConfig() Config {
 	return Config{
-		Socket:   DefaultSocket,
-		DataDir:  "./var",
+		DataDir:  "~/.curio",
 		Interval: 30 * time.Minute,
 		FrontN:   30,
 		KeepDays: 14,
@@ -102,6 +101,9 @@ func LoadConfig(path string) (Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
+	if cfg.DataDir, err = ExpandHome(cfg.DataDir); err != nil {
+		return cfg, err
+	}
 	if !filepath.IsAbs(cfg.DataDir) {
 		cfg.DataDir = filepath.Join(filepath.Dir(path), cfg.DataDir)
 	}
@@ -113,9 +115,6 @@ func LoadConfig(path string) (Config, error) {
 
 // Validate checks the values that would make curio unsafe or useless.
 func (c Config) Validate() error {
-	if c.Socket == "" || (!filepath.IsAbs(c.Socket) && !strings.HasPrefix(c.Socket, "~/")) {
-		return fmt.Errorf("socket %q: use an absolute path or a path in ~/", c.Socket)
-	}
 	if c.Interval < time.Minute {
 		return fmt.Errorf("interval %s: use one minute or more", c.Interval)
 	}
@@ -191,6 +190,11 @@ func EnsureAPIToken(path string, cfg *Config) (created bool, err error) {
 	if err != nil {
 		return false, fmt.Errorf("read config: %w", err)
 	}
+	if n, err := yamlDocuments(data); err != nil {
+		return false, err
+	} else if n > 1 {
+		return false, fmt.Errorf("%s has more than one YAML document; keep one document so curio can add api_token", path)
+	}
 	var saved struct {
 		APIToken string `yaml:"api_token"`
 	}
@@ -260,6 +264,23 @@ func setTokenYAML(data []byte, token string) ([]byte, error) {
 		return nil, fmt.Errorf("the updated config has another api_token; it was not saved")
 	}
 	return out.Bytes(), nil
+}
+
+// yamlDocuments counts the documents in a YAML stream.
+func yamlDocuments(data []byte) (int, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	n := 0
+	for {
+		var doc yaml.Node
+		err := dec.Decode(&doc)
+		if errors.Is(err, io.EOF) {
+			return n, nil
+		}
+		if err != nil {
+			return n, fmt.Errorf("parse config: %w", err)
+		}
+		n++
+	}
 }
 
 func makePrivate(path string) error {

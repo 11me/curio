@@ -1,7 +1,6 @@
 # curio configuration. Copy to curio.yml (ignored by git) and change it.
 # Relative paths are relative to this file.
-socket: ~/.curio/curio.sock   # API socket; curio keeps its folder private (0700)
-data_dir: ./var/curio    # SQLite database folder
+data_dir: ~/.curio       # database, run lock and API socket (sock/curio.sock); must be in your home folder
 interval: 30m            # front page refresh
 front_n: 30              # stories read from the front page
 days: 7                  # the list shows stories first seen in this many days

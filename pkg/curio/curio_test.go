@@ -50,8 +50,8 @@ func TestLoadConfig(t *testing.T) {
 
 	cfg, err := LoadConfig(path)
 	require.NoError(t, err)
-	assert.Equal(t, "~/.curio/curio.sock", cfg.Socket)
-	assert.Equal(t, filepath.Join(dir, "var", "curio"), cfg.DataDir)
+	home, _ := os.UserHomeDir()
+	assert.Equal(t, filepath.Join(home, ".curio"), cfg.DataDir)
 	assert.Equal(t, "haiku", cfg.Claude.Model)
 	assert.Len(t, cfg.Criteria, 9)
 	assert.Equal(t, 30*time.Minute, cfg.Interval)
@@ -64,9 +64,6 @@ func TestConfig_Validate(t *testing.T) {
 		want   string
 	}{
 		{name: "ok", change: func(*Config) {}},
-		{name: "relative socket", change: func(c *Config) { c.Socket = "curio.sock" }, want: "socket"},
-		{name: "empty socket", change: func(c *Config) { c.Socket = "" }, want: "socket"},
-		{name: "absolute socket", change: func(c *Config) { c.Socket = "/tmp/c/curio.sock" }},
 		{name: "short interval", change: func(c *Config) { c.Interval = time.Second }, want: "interval"},
 		{name: "bad cutoff", change: func(c *Config) { c.Cutoff = 2 }, want: "cutoff"},
 		{name: "no criteria", change: func(c *Config) { c.Criteria = nil }, want: "criteria"},

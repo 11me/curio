@@ -82,33 +82,6 @@ func privateTempDir(t *testing.T) string {
 	return dir
 }
 
-// Re-check 1, finding 2: curio serves on a socket in a folder only the owner can open.
-func TestListenSocket(t *testing.T) {
-	path := filepath.Join(privateTempDir(t), "run", "curio.sock")
-
-	ln, err := ListenSocket(path)
-	require.NoError(t, err)
-	info, err := os.Stat(filepath.Dir(path))
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(), "a new folder is private")
-	sock, err := os.Lstat(path)
-	require.NoError(t, err)
-	assert.NotZero(t, sock.Mode()&os.ModeSocket)
-	assert.Equal(t, os.FileMode(0o600), sock.Mode().Perm())
-
-	_, err = ListenSocket(path)
-	require.Error(t, err, "a second curio does not take over a live socket")
-	assert.Contains(t, err.Error(), "already")
-
-	require.NoError(t, ln.Close())
-	ln2, err := ListenSocket(path) // a stale socket file is replaced
-	require.NoError(t, err)
-	_ = ln2.Close()
-
-	_, err = ListenSocket("relative/curio.sock")
-	require.Error(t, err)
-}
-
 // Re-check 1, finding 3: the fetcher never connects to an address of this Mac.
 func TestPageFetcher_RefusesOwnAddress(t *testing.T) {
 	f := NewPageFetcher(time.Second, 1024)

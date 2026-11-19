@@ -57,7 +57,12 @@ func run(ctx context.Context, o opts) error {
 		return err
 	}
 	if o.Data != "" {
-		cfg.DataDir = o.Data
+		if cfg.DataDir, err = curio.ExpandHome(o.Data); err != nil {
+			return err
+		}
+		if cfg.DataDir, err = filepath.Abs(cfg.DataDir); err != nil {
+			return fmt.Errorf("data folder: %w", err)
+		}
 	}
 	created, err := curio.EnsureAPIToken(o.Config, &cfg)
 	if err != nil {
@@ -95,7 +100,7 @@ func run(ctx context.Context, o opts) error {
 		return svc.Refresh(ctx)
 	}
 
-	ln, err := curio.ListenSocket(cfg.Socket)
+	ln, err := runLock.Listen()
 	if err != nil {
 		return err
 	}

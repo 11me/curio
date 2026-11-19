@@ -30,21 +30,24 @@ In addition to intelligent feed curation, newscope provides:
 
 ## curio
 
-curio runs on your own computer. It serves its API only on the Unix socket
-`~/.curio/curio.sock` (setting `socket`), with the socket at mode 0600. The
-socket folder must be yours with mode 0700, and no folder above it may be
-writable by other users; curio makes a missing folder but never changes an
-existing one. It replaces an old socket only when nothing listens on it. Only
-one curio (the service or `--once`) runs with a data folder at a time.
+curio runs on your own computer. Its data folder (`data_dir`, default
+`~/.curio`) must be inside your home folder. It holds the database, a run
+lock and the API socket `sock/curio.sock`; there is no other API address and
+no socket setting. Only one curio (the service or `--once`) runs with a data
+folder at a time. curio makes the `sock` folder with mode 0700 and never
+changes an existing one. It refuses to start when a folder from your home
+folder down to `sock` belongs to another user, lets group or other users
+write, or has an ACL entry that allows access. It removes an old socket only
+while it holds the data folder lock.
 
 1. Install the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) and log in once with `claude`.
 2. Copy `curio.example.yml` to `curio.yml` and change the criteria if you want.
 3. Run it:
 
    ```sh
-   go run ./cmd/curio -c curio.yml            # server on ~/.curio/curio.sock
+   go run ./cmd/curio -c curio.yml            # server on ~/.curio/sock/curio.sock
    go run ./cmd/curio -c curio.yml --once     # one refresh, then exit
-   go run ./cmd/curio -c curio.yml --data /tmp/curio-test   # other data folder
+   go run ./cmd/curio -c curio.yml --data ~/curio-test   # other data folder (in your home)
    ```
 
 Each refresh reads the front page (`front_n` stories), gets the article text,
@@ -52,7 +55,8 @@ and sends new stories to the model in batches (`claude.batch_size` stories in
 one call). Known stories only get new points and comment counts.
 
 On the first run curio sets a random `api_token` in `curio.yml` (also when
-the key is empty or null). It takes a lock so two first starts make one token,
+the key is empty or null). It refuses a config with more than one YAML
+document and leaves it unchanged. It takes a lock so two first starts make one token,
 checks that the new file reads back, and writes it to a 0600 temp file that
 it renames over the old one, so the token is never in a file that others can
 read. The rewrite keeps your settings and comments but may change spacing. Paste the token once into the
