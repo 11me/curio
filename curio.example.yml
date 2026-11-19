@@ -1,6 +1,6 @@
 # curio configuration. Copy to curio.yml (ignored by git) and change it.
 # Relative paths are relative to this file.
-listen: 127.0.0.1:8090   # loopback only: curio has no login
+socket: ~/.curio/curio.sock   # API socket; curio keeps its folder private (0700)
 data_dir: ./var/curio    # SQLite database folder
 interval: 30m            # front page refresh
 front_n: 30              # stories read from the front page

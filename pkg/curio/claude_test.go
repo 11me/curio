@@ -85,7 +85,7 @@ func TestClaudeScorer_Errors(t *testing.T) {
 func TestSubscriptionEnv(t *testing.T) {
 	env, err := subscriptionEnv([]string{"PATH=/bin", "ANTHROPIC_API_KEY=x", "ANTHROPIC_AUTH_TOKEN=y", "ANTHROPIC_BASE_URL=http://proxy", "HOME=/h", "CLAUDE_CODE_USE_BEDROCK=0"})
 	require.NoError(t, err)
-	assert.Equal(t, []string{"PATH=/bin", "HOME=/h", "CLAUDE_CODE_USE_BEDROCK=0"}, env)
+	assert.Equal(t, []string{"PATH=/bin", "HOME=/h"}, env)
 
 	for _, kv := range []string{"CLAUDE_CODE_USE_BEDROCK=1", "CLAUDE_CODE_USE_VERTEX=true", "CLAUDE_CODE_USE_FOUNDRY=1"} {
 		_, err := subscriptionEnv([]string{"PATH=/bin", kv})

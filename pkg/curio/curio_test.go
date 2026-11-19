@@ -50,7 +50,7 @@ func TestLoadConfig(t *testing.T) {
 
 	cfg, err := LoadConfig(path)
 	require.NoError(t, err)
-	assert.Equal(t, "127.0.0.1:8090", cfg.Listen)
+	assert.Equal(t, "~/.curio/curio.sock", cfg.Socket)
 	assert.Equal(t, filepath.Join(dir, "var", "curio"), cfg.DataDir)
 	assert.Equal(t, "haiku", cfg.Claude.Model)
 	assert.Len(t, cfg.Criteria, 9)
@@ -64,10 +64,9 @@ func TestConfig_Validate(t *testing.T) {
 		want   string
 	}{
 		{name: "ok", change: func(*Config) {}},
-		{name: "public listen", change: func(c *Config) { c.Listen = "0.0.0.0:8090" }, want: "loopback"},
-		{name: "empty host", change: func(c *Config) { c.Listen = ":8090" }, want: "loopback"},
-		{name: "localhost", change: func(c *Config) { c.Listen = "localhost:8090" }},
-		{name: "ipv6 loopback", change: func(c *Config) { c.Listen = "[::1]:8090" }},
+		{name: "relative socket", change: func(c *Config) { c.Socket = "curio.sock" }, want: "socket"},
+		{name: "empty socket", change: func(c *Config) { c.Socket = "" }, want: "socket"},
+		{name: "absolute socket", change: func(c *Config) { c.Socket = "/tmp/c/curio.sock" }},
 		{name: "short interval", change: func(c *Config) { c.Interval = time.Second }, want: "interval"},
 		{name: "bad cutoff", change: func(c *Config) { c.Cutoff = 2 }, want: "cutoff"},
 		{name: "no criteria", change: func(c *Config) { c.Criteria = nil }, want: "criteria"},

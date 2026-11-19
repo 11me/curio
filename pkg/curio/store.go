@@ -330,3 +330,34 @@ func (s *Store) AddUsage(ctx context.Context, day string, calls, stories int) er
 	}
 	return nil
 }
+
+// Reserve takes one model call and up to want stories from the day's
+// allowance in one write transaction (BEGIN IMMEDIATE), so two curio
+// processes cannot both use the last of it. It returns the stories granted;
+// 0 means the call or story limit is reached.
+func (s *Store) Reserve(ctx context.Context, day string, maxCalls, maxStories, want int) (granted int, err error) {
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO usage (day) VALUES (?) ON CONFLICT(day) DO NOTHING`, day); err != nil {
+		return 0, fmt.Errorf("usage row: %w", err)
+	}
+	var calls, stories int
+	if err := tx.QueryRowxContext(ctx, `SELECT calls, stories FROM usage WHERE day = ?`, day).Scan(&calls, &stories); err != nil {
+		return 0, fmt.Errorf("read usage: %w", err)
+	}
+	granted = min(want, maxStories-stories)
+	if calls >= maxCalls || granted <= 0 {
+		return 0, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE usage SET calls = calls + 1, stories = stories + ? WHERE day = ?`,
+		granted, day); err != nil {
+		return 0, fmt.Errorf("save usage: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit usage: %w", err)
+	}
+	return granted, nil
+}

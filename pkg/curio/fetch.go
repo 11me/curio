@@ -25,7 +25,14 @@ type PageFetcher struct {
 	MaxBytes int64                     // largest page body read, after decompression
 	MinText  int                       // shorter text counts as no text
 	Allow    func(netip.AddrPort) bool // nil means PublicAddr
-	client   *http.Client
+
+	// LocalAddrs lists this computer's own addresses; nil means its interfaces.
+	LocalAddrs func() ([]netip.Addr, error)
+	// Lookup resolves a host; nil means the system resolver.
+	Lookup func(ctx context.Context, host string) ([]netip.Addr, error)
+	// Dial connects to a checked address; nil means a TCP dialer.
+	Dial   func(ctx context.Context, network, addr string) (net.Conn, error)
+	client *http.Client
 }
 
 // NewPageFetcher makes a fetcher with a total time limit and a size limit.
@@ -35,11 +42,49 @@ func NewPageFetcher(timeout time.Duration, maxBytes int64) *PageFetcher {
 
 var errBlockedAddr = errors.New("not a public address")
 
-func (f *PageFetcher) allowed(ap netip.AddrPort) bool {
+// permitted reports whether curio may connect to an address: a public
+// address (or Allow) that is not one of this computer's own addresses. A
+// public address of this Mac can reach services that its firewall hides
+// from the internet.
+func (f *PageFetcher) permitted(ap netip.AddrPort) bool {
+	ok := PublicAddr(ap.Addr())
 	if f.Allow != nil {
-		return f.Allow(ap)
+		ok = f.Allow(ap)
 	}
-	return PublicAddr(ap.Addr())
+	if !ok {
+		return false
+	}
+	own, err := f.localAddrs()
+	if err != nil {
+		return false // without the list curio cannot rule this Mac out
+	}
+	for _, a := range own {
+		if a.Unmap() == ap.Addr().Unmap() {
+			return false
+		}
+	}
+	return true
+}
+
+func (f *PageFetcher) localAddrs() ([]netip.Addr, error) {
+	if f.LocalAddrs != nil {
+		return f.LocalAddrs()
+	}
+	return interfaceAddrs()
+}
+
+func interfaceAddrs() ([]netip.Addr, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, fmt.Errorf("interface addresses: %w", err)
+	}
+	out := make([]netip.Addr, 0, len(addrs))
+	for _, a := range addrs {
+		if p, err := netip.ParsePrefix(a.String()); err == nil {
+			out = append(out, p.Addr().Unmap())
+		}
+	}
+	return out, nil
 }
 
 func (f *PageFetcher) httpClient() *http.Client {
@@ -58,17 +103,39 @@ func (f *PageFetcher) httpClient() *http.Client {
 			if err != nil {
 				return nil, fmt.Errorf("port %q: %w", portStr, err)
 			}
-			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			lookup := f.Lookup
+			if lookup == nil {
+				lookup = func(ctx context.Context, host string) ([]netip.Addr, error) {
+					return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+				}
+			}
+			ips, err := lookup(ctx, host)
 			if err != nil {
 				return nil, fmt.Errorf("resolve %s: %w", host, err)
 			}
+			dial := f.Dial
+			if dial == nil {
+				dial = dialer.DialContext
+			}
+			// try each permitted address in turn, within the request deadline;
+			// connect to the checked address, never to the name again
+			var lastErr error
 			for _, ip := range ips {
 				ap := netip.AddrPortFrom(ip.Unmap(), uint16(port))
-				if !f.allowed(ap) {
+				if !f.permitted(ap) {
 					continue
 				}
-				// connect to the checked address, not to the name again
-				return dialer.DialContext(ctx, network, ap.String())
+				conn, err := dial(ctx, network, ap.String())
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
+				if ctx.Err() != nil {
+					break
+				}
+			}
+			if lastErr != nil {
+				return nil, fmt.Errorf("connect to %s: %w", host, lastErr)
 			}
 			return nil, fmt.Errorf("%s: %w", host, errBlockedAddr)
 		},

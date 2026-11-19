@@ -20,6 +20,9 @@ const articleHTML = `<html><head><title>T</title></head><body><article><h1>Title
 <p>The release also stabilizes several library functions and improves incremental builds on all platforms.</p>
 </article></body></html>`
 
+// noLocalAddrs lets tests reach httptest servers on loopback.
+func noLocalAddrs() ([]netip.Addr, error) { return nil, nil }
+
 func portOf(t *testing.T, srv *httptest.Server) uint16 {
 	t.Helper()
 	u, err := url.Parse(srv.URL)
@@ -80,6 +83,7 @@ func TestPageFetcher_RefusesRedirectToBlockedAddress(t *testing.T) {
 	f := NewPageFetcher(5*time.Second, 1<<20)
 	allowed := portOf(t, public)
 	f.Allow = func(ap netip.AddrPort) bool { return ap.Port() == allowed }
+	f.LocalAddrs = noLocalAddrs
 	_, err := f.Text(context.Background(), public.URL)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a public address")
@@ -93,6 +97,7 @@ func TestPageFetcher_RefusesOtherSchemesAndHugePages(t *testing.T) {
 	defer big.Close()
 	f := NewPageFetcher(5*time.Second, 1024)
 	f.Allow = func(netip.AddrPort) bool { return true }
+	f.LocalAddrs = noLocalAddrs
 
 	_, err := f.Text(context.Background(), big.URL)
 	require.Error(t, err)
@@ -112,6 +117,7 @@ func TestPageFetcher_ExtractsText(t *testing.T) {
 	defer srv.Close()
 	f := NewPageFetcher(5*time.Second, 1<<20)
 	f.Allow = func(netip.AddrPort) bool { return true }
+	f.LocalAddrs = noLocalAddrs
 	text, err := f.Text(context.Background(), srv.URL)
 	require.NoError(t, err)
 	assert.Contains(t, text, "faster compiler")

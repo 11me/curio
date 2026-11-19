@@ -25,6 +25,7 @@ type Service struct {
 
 	mu          sync.Mutex
 	running     bool
+	pending     bool // a manual refresh waits in the trigger channel
 	lastStart   time.Time
 	lastRefresh time.Time
 	lastError   string
@@ -86,21 +87,27 @@ func (s *Service) Trigger() (ok bool, wait time.Duration) {
 	s.init()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.running {
+	if s.running || s.pending {
 		return false, s.Cfg.Limits.MinRefresh
 	}
-	if !s.lastStart.IsZero() {
-		if left := s.Cfg.Limits.MinRefresh - s.now().Sub(s.lastStart); left > 0 {
-			return false, left
-		}
+	if left := s.waitLocked(); left > 0 {
+		return false, left
 	}
 	select {
 	case s.trigger <- struct{}{}:
-		s.lastStart = s.now() // counts as started, so a second request waits
+		s.pending = true
 		return true, 0
 	default:
 		return false, s.Cfg.Limits.MinRefresh
 	}
+}
+
+// waitLocked returns the time left before the next refresh may start.
+func (s *Service) waitLocked() time.Duration {
+	if s.lastStart.IsZero() {
+		return 0
+	}
+	return max(0, s.Cfg.Limits.MinRefresh-s.now().Sub(s.lastStart))
 }
 
 // Run refreshes at start, on every interval and on Trigger, until ctx ends.
@@ -117,15 +124,25 @@ func (s *Service) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 		case <-s.trigger:
+			s.mu.Lock()
+			s.pending = false
+			s.mu.Unlock()
 		}
 	}
 }
 
-// Refresh runs one full refresh. It returns at once if a refresh is running.
+// Refresh runs one full refresh. It returns at once if a refresh is running
+// or the last one started less than limits.min_refresh ago; this holds for
+// the schedule, manual requests and the first run alike.
 func (s *Service) Refresh(ctx context.Context) error {
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
+		return nil
+	}
+	if left := s.waitLocked(); left > 0 {
+		s.mu.Unlock()
+		log.Printf("[DEBUG] refresh skipped; the last one started less than %s ago", s.Cfg.Limits.MinRefresh)
 		return nil
 	}
 	s.running = true
@@ -216,28 +233,26 @@ func (s *Service) scoreAll(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	s.setNote("")
-	day := now.Format(time.DateOnly)
 	total := 0
 	for start := 0; start < len(rows); {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
-		calls, sent, err := s.Store.Usage(ctx, day)
+		// the day of each reservation, so a batch after midnight counts on the new day
+		day := s.now().Format(time.DateOnly)
+		room, err := s.Store.Reserve(ctx, day, s.Cfg.Limits.DailyCalls, s.Cfg.Limits.DailyStories,
+			min(s.Cfg.Claude.BatchSize, len(rows)-start))
 		if err != nil {
 			return total, err
 		}
-		room := min(s.Cfg.Claude.BatchSize, s.Cfg.Limits.DailyStories-sent, len(rows)-start)
-		if calls >= s.Cfg.Limits.DailyCalls || room <= 0 {
+		if room == 0 {
 			left := len(rows) - start
-			log.Printf("[WARN] daily limit reached (%d calls, %d stories); %d stories wait for tomorrow", calls, sent, left)
+			log.Printf("[WARN] daily limit reached on %s; %d stories wait for the next UTC day", day, left)
 			s.setNote(fmt.Sprintf("daily limit reached; stories that wait for the next UTC day: %d", left))
 			break
 		}
 		batch := rows[start : start+room]
 		start += room
-		if err := s.Store.AddUsage(ctx, day, 1, len(batch)); err != nil {
-			return total, err
-		}
 		res, err := s.Scorer.Score(ctx, ScoreInput{Stories: batch, PastPicks: picks, PastRejects: rejects})
 		if err != nil {
 			log.Printf("[WARN] score batch of %d: %v", len(batch), err)

@@ -64,8 +64,8 @@ func run(ctx context.Context, o opts) error {
 		return err
 	}
 	if created {
-		log.Printf("[INFO] made an API token in %s (api_token). Give it to the bb plugin: "+
-			"bb plugin config curio set apiToken <the api_token value>", o.Config)
+		log.Printf("[INFO] made an API token in %s (api_token). Paste it into the masked field "+
+			"bb Settings > Plugins > curio > curio API token", o.Config)
 	}
 	if err := curio.CheckSubscriptionEnv(os.Environ()); err != nil {
 		return err
@@ -90,8 +90,11 @@ func run(ctx context.Context, o opts) error {
 		return svc.Refresh(ctx)
 	}
 
+	ln, err := curio.ListenSocket(cfg.Socket)
+	if err != nil {
+		return err
+	}
 	srv := &http.Server{
-		Addr:              cfg.Listen,
 		Handler:           (&curio.API{Svc: svc, Token: cfg.APIToken}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -104,8 +107,8 @@ func run(ctx context.Context, o opts) error {
 		defer done()
 		_ = srv.Shutdown(shutCtx)
 	}()
-	log.Printf("[INFO] curio on http://%s, data in %s", cfg.Listen, cfg.DataDir)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	log.Printf("[INFO] curio on unix socket %s, data in %s", ln.Addr(), cfg.DataDir)
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server: %w", err)
 	}
 	return nil

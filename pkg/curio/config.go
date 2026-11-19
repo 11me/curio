@@ -6,12 +6,11 @@ package curio
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -19,7 +18,7 @@ import (
 
 // Config is the curio configuration file.
 type Config struct {
-	Listen   string        `yaml:"listen"`    // loopback address, for example 127.0.0.1:8090
+	Socket   string        `yaml:"socket"`    // Unix socket of the API, in a folder only the owner can open
 	DataDir  string        `yaml:"data_dir"`  // folder for the SQLite database
 	Interval time.Duration `yaml:"interval"`  // time between front page refreshes
 	FrontN   int           `yaml:"front_n"`   // number of front page stories to read
@@ -68,7 +67,7 @@ var idRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,39}$`)
 // DefaultConfig returns the built-in defaults.
 func DefaultConfig() Config {
 	return Config{
-		Listen:   "127.0.0.1:8090",
+		Socket:   DefaultSocket,
 		DataDir:  "./var",
 		Interval: 30 * time.Minute,
 		FrontN:   30,
@@ -112,12 +111,8 @@ func LoadConfig(path string) (Config, error) {
 
 // Validate checks the values that would make curio unsafe or useless.
 func (c Config) Validate() error {
-	host, _, err := net.SplitHostPort(c.Listen)
-	if err != nil {
-		return fmt.Errorf("listen %q: %w", c.Listen, err)
-	}
-	if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-		return fmt.Errorf("listen %q: curio has no login, use a loopback address", c.Listen)
+	if c.Socket == "" || (!filepath.IsAbs(c.Socket) && !strings.HasPrefix(c.Socket, "~/")) {
+		return fmt.Errorf("socket %q: use an absolute path or a path in ~/", c.Socket)
 	}
 	if c.Interval < time.Minute {
 		return fmt.Errorf("interval %s: use one minute or more", c.Interval)
@@ -171,35 +166,77 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// EnsureAPIToken makes a random API token when the config has none, appends
-// it to the config file, and keeps the file private (mode 0600).
+var emptyTokenRe = regexp.MustCompile(`(?m)^api_token:[ \t]*(""|'')?[ \t]*(#.*)?$`)
+
+// EnsureAPIToken makes a random API token when the config has none. It writes
+// the new config to a 0600 temp file in the same folder and renames it over
+// the old file, so the token never sits in a file that others can read.
+// An existing config with a token gets mode 0600.
 func EnsureAPIToken(path string, cfg *Config) (created bool, err error) {
-	if cfg.APIToken == "" {
-		buf := make([]byte, 32)
-		if _, err := rand.Read(buf); err != nil {
-			return false, fmt.Errorf("make token: %w", err)
-		}
-		token := hex.EncodeToString(buf)
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // path comes from the operator
+	if cfg.APIToken != "" {
+		info, err := os.Stat(path)
 		if err != nil {
-			return false, fmt.Errorf("open config: %w", err)
+			return false, fmt.Errorf("stat config: %w", err)
 		}
-		_, werr := fmt.Fprintf(f, "\n# API token for the bb plugin, made by curio. Keep this file private.\napi_token: %s\n", token)
-		cerr := f.Close()
-		if werr != nil || cerr != nil {
-			return false, fmt.Errorf("save token: %w", errors.Join(werr, cerr))
+		if info.Mode().Perm()&0o077 != 0 {
+			if err := os.Chmod(path, 0o600); err != nil {
+				return false, fmt.Errorf("make config private: %w", err)
+			}
 		}
-		cfg.APIToken = token
-		created = true
+		return false, nil
 	}
-	info, err := os.Stat(path)
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return false, fmt.Errorf("make token: %w", err)
+	}
+	token := hex.EncodeToString(buf)
+	old, err := os.ReadFile(path) //nolint:gosec // path comes from the operator
 	if err != nil {
-		return created, fmt.Errorf("stat config: %w", err)
+		return false, fmt.Errorf("read config: %w", err)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		if err := os.Chmod(path, 0o600); err != nil {
-			return created, fmt.Errorf("make config private: %w", err)
+	entry := "api_token: " + token
+	var updated string
+	if emptyTokenRe.Match(old) {
+		updated = emptyTokenRe.ReplaceAllLiteralString(string(old), entry)
+	} else {
+		updated = strings.TrimRight(string(old), "\n") +
+			"\n\n# API token for the bb plugin, made by curio. Keep this file private.\n" + entry + "\n"
+	}
+	if err := writePrivate(path, []byte(updated)); err != nil {
+		return false, err
+	}
+	cfg.APIToken = token
+	return true, nil
+}
+
+// writePrivate replaces path with data through a new 0600 file and a rename.
+func writePrivate(path string, data []byte) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".curio-*.yml") // CreateTemp uses mode 0600
+	if err != nil {
+		return fmt.Errorf("create temp config: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmp.Name())
 		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("make temp config private: %w", err)
 	}
-	return created, nil
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp config: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("replace config: %w", err)
+	}
+	return nil
 }

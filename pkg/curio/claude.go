@@ -208,22 +208,31 @@ func execRun(ctx context.Context, name string, args []string, stdin []byte, env 
 	return stdout.Bytes(), nil
 }
 
-// subscriptionEnv drops API key and endpoint variables so the CLI uses its
-// own login, and refuses to run when a cloud provider is turned on, because
-// those calls bill a cloud account instead of the subscription.
+// subscriptionEnvNames are the only variables the CLI gets: what a
+// subscription login needs to find the user, the keychain and the binary.
+// Everything else (API keys, endpoints, cloud accounts, model overrides)
+// stays out, so a call can only use the Claude subscription.
+var subscriptionEnvNames = map[string]bool{
+	"HOME": true, "USER": true, "LOGNAME": true, "SHELL": true, "PATH": true, "TMPDIR": true,
+	"LANG": true, "LC_ALL": true, "LC_CTYPE": true, "TERM": true, "XDG_CONFIG_HOME": true, "CLAUDE_CONFIG_DIR": true,
+}
+
+// subscriptionEnv keeps only subscriptionEnvNames. It refuses to run when
+// any CLAUDE_CODE_USE_* provider switch is on, because the owner then
+// expects cloud billing, and curio must not use it.
 func subscriptionEnv(env []string) ([]string, error) {
-	out := make([]string, 0, len(env))
+	out := make([]string, 0, len(subscriptionEnvNames))
 	for _, kv := range env {
 		name, value, _ := strings.Cut(kv, "=")
-		switch name {
-		case "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL":
-			continue
-		case "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY":
+		if strings.HasPrefix(name, "CLAUDE_CODE_USE_") {
 			if v := strings.ToLower(strings.TrimSpace(value)); v != "" && v != "0" && v != "false" {
 				return nil, fmt.Errorf("%s is on: curio uses only the Claude subscription, not a cloud provider; unset it", name)
 			}
+			continue
 		}
-		out = append(out, kv)
+		if subscriptionEnvNames[name] {
+			out = append(out, kv)
+		}
 	}
 	return out, nil
 }
