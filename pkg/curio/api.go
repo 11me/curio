@@ -1,6 +1,7 @@
 package curio
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +19,8 @@ import (
 
 // API serves the JSON API for the bb view.
 type API struct {
-	Svc *Service
+	Svc   *Service
+	Token string // bearer token; an empty token refuses every call
 }
 
 // ListItem is one row of the list.
@@ -74,13 +76,14 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/stories/{id}/mark", a.mark)
 	mux.HandleFunc("POST /api/v1/stories/{id}/task", a.task)
 	mux.HandleFunc("POST /api/v1/refresh", a.refresh)
-	return guard(mux)
+	return guard(a.Token, mux)
 }
 
-// guard lets in only local, non-browser calls: a loopback Host (no DNS
-// rebinding), no Origin header (no cross-site pages), and JSON bodies on POST
-// (a form post from a page cannot set that type without a CORS preflight).
-func guard(next http.Handler) http.Handler {
+// guard lets in only local, non-browser calls with the API token: a loopback
+// Host (no DNS rebinding), no Origin header (no cross-site pages), the bearer
+// token (no other users or pages), and JSON bodies on POST.
+func guard(token string, next http.Handler) http.Handler {
+	want := []byte("Bearer " + token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !loopbackHost(r.Host) {
 			writeErr(w, http.StatusForbidden, "host not allowed")
@@ -88,6 +91,11 @@ func guard(next http.Handler) http.Handler {
 		}
 		if r.Header.Get("Origin") != "" || r.Header.Get("Sec-Fetch-Site") == "cross-site" {
 			writeErr(w, http.StatusForbidden, "browser calls are not allowed")
+			return
+		}
+		got := []byte(r.Header.Get("Authorization"))
+		if token == "" || subtle.ConstantTimeCompare(got, want) != 1 {
+			writeErr(w, http.StatusUnauthorized, "missing or wrong API token")
 			return
 		}
 		if r.Method == http.MethodPost {
@@ -310,7 +318,10 @@ func (a *API) task(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) refresh(w http.ResponseWriter, _ *http.Request) {
-	a.Svc.Trigger()
+	if ok, wait := a.Svc.Trigger(); !ok {
+		writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("a refresh ran recently; wait %s", wait.Round(time.Second)))
+		return
+	}
 	writeJSON(w, http.StatusAccepted, a.Svc.Status())
 }
 

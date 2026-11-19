@@ -55,7 +55,13 @@ CREATE TABLE IF NOT EXISTS stories (
 	score_attempts INTEGER NOT NULL DEFAULT 0,
 	mark TEXT NOT NULL DEFAULT '',
 	marked_at DATETIME,
-	task_key TEXT NOT NULL DEFAULT ''
+	task_key TEXT NOT NULL DEFAULT '',
+	score_failed_at DATETIME
+);
+CREATE TABLE IF NOT EXISTS usage (
+	day TEXT PRIMARY KEY,
+	calls INTEGER NOT NULL DEFAULT 0,
+	stories INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_stories_first_seen ON stories(first_seen DESC);
 CREATE INDEX IF NOT EXISTS idx_stories_mark ON stories(mark, marked_at DESC);
@@ -72,6 +78,12 @@ func OpenStore(ctx context.Context, path string) (*Store, error) {
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
+	}
+	// databases from the first build have no score_failed_at column
+	if _, err := db.ExecContext(ctx, `ALTER TABLE stories ADD COLUMN score_failed_at DATETIME`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		_ = db.Close()
+		return nil, fmt.Errorf("add column: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -104,6 +116,7 @@ type StoryRow struct {
 	Mark          string       `db:"mark"`
 	MarkedAt      sql.NullTime `db:"marked_at"`
 	TaskKey       string       `db:"task_key"`
+	ScoreFailedAt sql.NullTime `db:"score_failed_at"`
 }
 
 // Answers decodes the stored answers.
@@ -174,13 +187,14 @@ func (s *Store) SaveText(ctx context.Context, id int64, text, extractErr string,
 	return nil
 }
 
-// NeedScore returns unscored stories with fewer than maxAttempts failed tries,
-// the newest first.
-func (s *Store) NeedScore(ctx context.Context, maxAttempts, limit int) ([]StoryRow, error) {
+// NeedScore returns unscored stories with fewer than maxAttempts failed tries
+// and no failed try after retryBefore, the newest first.
+func (s *Store) NeedScore(ctx context.Context, maxAttempts int, retryBefore time.Time, limit int) ([]StoryRow, error) {
 	var rows []StoryRow
 	err := s.db.SelectContext(ctx, &rows, `
 		SELECT * FROM stories WHERE scored_at IS NULL AND score_attempts < ?
-		ORDER BY first_seen DESC, rank LIMIT ?`, maxAttempts, limit)
+		AND (score_failed_at IS NULL OR score_failed_at <= ?)
+		ORDER BY first_seen DESC, rank LIMIT ?`, maxAttempts, retryBefore, limit)
 	if err != nil {
 		return nil, fmt.Errorf("select unscored stories: %w", err)
 	}
@@ -203,9 +217,9 @@ func (s *Store) SaveScore(ctx context.Context, id int64, summary string, answers
 }
 
 // SaveScoreError records a failed scoring attempt.
-func (s *Store) SaveScoreError(ctx context.Context, id int64, msg string) error {
+func (s *Store) SaveScoreError(ctx context.Context, id int64, msg string, now time.Time) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE stories SET score_error = ?, score_attempts = score_attempts + 1 WHERE id = ?`, msg, id)
+		`UPDATE stories SET score_error = ?, score_attempts = score_attempts + 1, score_failed_at = ? WHERE id = ?`, msg, now, id)
 	if err != nil {
 		return fmt.Errorf("save score error %d: %w", id, err)
 	}
@@ -291,4 +305,28 @@ func Domain(link string) string {
 		return ""
 	}
 	return strings.TrimPrefix(strings.ToLower(u.Hostname()), "www.")
+}
+
+// Usage returns the model calls and stories counted for one day (YYYY-MM-DD).
+func (s *Store) Usage(ctx context.Context, day string) (calls, stories int, err error) {
+	row := s.db.QueryRowxContext(ctx, `SELECT calls, stories FROM usage WHERE day = ?`, day)
+	if err := row.Scan(&calls, &stories); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("read usage: %w", err)
+	}
+	return calls, stories, nil
+}
+
+// AddUsage counts model calls and stories for one day.
+func (s *Store) AddUsage(ctx context.Context, day string, calls, stories int) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO usage (day, calls, stories) VALUES (?, ?, ?)
+		ON CONFLICT(day) DO UPDATE SET calls = calls + excluded.calls, stories = stories + excluded.stories`,
+		day, calls, stories)
+	if err != nil {
+		return fmt.Errorf("save usage: %w", err)
+	}
+	return nil
 }

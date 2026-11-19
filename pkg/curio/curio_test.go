@@ -178,8 +178,9 @@ func TestService_Refresh(t *testing.T) {
 	sc := &fakeScorer{fail: map[int64]bool{3: true}}
 	stories := front(1, 2, 3)
 	stories = append(stories, hn.Story{ID: 4, Title: "Ask HN: x", URL: hn.DiscussionURL(4), Text: "question", Posted: t0, Rank: 4})
+	now := t0
 	svc := &Service{Cfg: testConfig(), Store: st, HN: fakeFront{stories: stories}, Extractor: x, Scorer: sc,
-		Now: func() time.Time { return t0 }}
+		Now: func() time.Time { return now }}
 	require.NoError(t, svc.Refresh(ctx))
 
 	assert.Len(t, x.calls, 3, "text posts are not extracted")
@@ -203,6 +204,9 @@ func TestService_Refresh(t *testing.T) {
 	require.NoError(t, st.SetMark(ctx, 1, MarkGood, t0))
 	sc.fail = nil
 	require.NoError(t, svc.Refresh(ctx))
+	require.Len(t, sc.batches, 2, "failed stories wait for retry_after")
+	now = now.Add(svc.Cfg.Limits.RetryAfter + time.Minute)
+	require.NoError(t, svc.Refresh(ctx))
 	require.Len(t, sc.batches, 3)
 	assert.Equal(t, []string{"Story A"}, sc.batches[2].PastPicks)
 	require.Len(t, sc.batches[2].Stories, 2)
@@ -214,4 +218,100 @@ func TestService_RefreshFrontError(t *testing.T) {
 	svc := &Service{Cfg: testConfig(), Store: newTestStore(t), HN: fakeFront{err: errors.New("offline")}, Scorer: &fakeScorer{}}
 	require.Error(t, svc.Refresh(context.Background()))
 	assert.Contains(t, svc.Status().LastError, "offline")
+}
+
+func TestEnsureAPIToken(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "curio.yml")
+	data, err := os.ReadFile("../../curio.example.yml")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o644))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	require.Empty(t, cfg.APIToken)
+	created, err := EnsureAPIToken(path, &cfg)
+	require.NoError(t, err)
+	assert.True(t, created)
+	assert.Len(t, cfg.APIToken, 64)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "the config holds a secret now")
+	again, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.Equal(t, cfg.APIToken, again.APIToken, "the token is saved in the config")
+	assert.Len(t, again.Criteria, 9, "the rest of the config is kept")
+
+	require.NoError(t, os.Chmod(path, 0o644))
+	created, err = EnsureAPIToken(path, &again)
+	require.NoError(t, err)
+	assert.False(t, created)
+	info, err = os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "a loose mode is fixed")
+
+	bad := again
+	bad.APIToken = "short"
+	require.Error(t, bad.Validate())
+}
+
+func manyStories(n int) []hn.Story {
+	ids := make([]int64, n)
+	for i := range ids {
+		ids[i] = int64(i + 1)
+	}
+	return front(ids...)
+}
+
+func TestService_DailyLimits(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := t0
+	cfg := testConfig()
+	cfg.Extract = false
+	cfg.Claude.BatchSize = 2
+	cfg.Limits.DailyCalls = 1
+	sc := &fakeScorer{}
+	svc := &Service{Cfg: cfg, Store: st, HN: fakeFront{stories: manyStories(5)}, Scorer: sc, Now: func() time.Time { return now }}
+
+	require.NoError(t, svc.Refresh(ctx))
+	require.Len(t, sc.batches, 1, "one call a day")
+	assert.Contains(t, svc.Status().Note, "daily limit")
+
+	// a restart does not reset the count
+	svc2 := &Service{Cfg: cfg, Store: st, HN: fakeFront{stories: manyStories(5)}, Scorer: sc, Now: func() time.Time { return now }}
+	require.NoError(t, svc2.Refresh(ctx))
+	require.Len(t, sc.batches, 1)
+
+	now = now.Add(24 * time.Hour)
+	require.NoError(t, svc2.Refresh(ctx))
+	require.Len(t, sc.batches, 2, "a new day has a new budget")
+	assert.Contains(t, svc2.Status().Note, "next UTC day: 1")
+
+	// the story cap trims the last batch
+	st2 := newTestStore(t)
+	cfg.Limits.DailyCalls = 10
+	cfg.Limits.DailyStories = 3
+	sc2 := &fakeScorer{}
+	svc3 := &Service{Cfg: cfg, Store: st2, HN: fakeFront{stories: manyStories(5)}, Scorer: sc2, Now: func() time.Time { return now }}
+	require.NoError(t, svc3.Refresh(ctx))
+	require.Len(t, sc2.batches, 2)
+	assert.Len(t, sc2.batches[1].Stories, 1)
+}
+
+func TestService_TriggerKeepsMinInterval(t *testing.T) {
+	now := t0
+	cfg := testConfig()
+	cfg.Extract = false
+	svc := &Service{Cfg: cfg, Store: newTestStore(t), HN: fakeFront{}, Scorer: &fakeScorer{}, Now: func() time.Time { return now }}
+	require.NoError(t, svc.Refresh(context.Background()))
+	ok, wait := svc.Trigger()
+	assert.False(t, ok)
+	assert.Equal(t, cfg.Limits.MinRefresh, wait)
+	now = now.Add(cfg.Limits.MinRefresh)
+	ok, _ = svc.Trigger()
+	assert.True(t, ok)
+	ok, _ = svc.Trigger()
+	assert.False(t, ok, "only one refresh waits at a time")
 }

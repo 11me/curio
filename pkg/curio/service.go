@@ -25,8 +25,10 @@ type Service struct {
 
 	mu          sync.Mutex
 	running     bool
+	lastStart   time.Time
 	lastRefresh time.Time
 	lastError   string
+	note        string
 	trigger     chan struct{}
 	once        sync.Once
 }
@@ -51,6 +53,7 @@ type Status struct {
 	Refreshing  bool       `json:"refreshing"`
 	LastRefresh *time.Time `json:"last_refresh"`
 	LastError   string     `json:"last_error,omitempty"`
+	Note        string     `json:"note,omitempty"` // for example a reached daily limit
 }
 
 func (s *Service) now() time.Time {
@@ -68,7 +71,7 @@ func (s *Service) init() {
 func (s *Service) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := Status{Refreshing: s.running, LastError: s.lastError}
+	st := Status{Refreshing: s.running, LastError: s.lastError, Note: s.note}
 	if !s.lastRefresh.IsZero() {
 		t := s.lastRefresh
 		st.LastRefresh = &t
@@ -76,12 +79,27 @@ func (s *Service) Status() Status {
 	return st
 }
 
-// Trigger asks the run loop for a refresh now. Extra calls while one waits are dropped.
-func (s *Service) Trigger() {
+// Trigger asks the run loop for a refresh now. It refuses, and returns the
+// time to wait, while a refresh runs or waits, or when the last refresh
+// started less than limits.min_refresh ago.
+func (s *Service) Trigger() (ok bool, wait time.Duration) {
 	s.init()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		return false, s.Cfg.Limits.MinRefresh
+	}
+	if !s.lastStart.IsZero() {
+		if left := s.Cfg.Limits.MinRefresh - s.now().Sub(s.lastStart); left > 0 {
+			return false, left
+		}
+	}
 	select {
 	case s.trigger <- struct{}{}:
+		s.lastStart = s.now() // counts as started, so a second request waits
+		return true, 0
 	default:
+		return false, s.Cfg.Limits.MinRefresh
 	}
 }
 
@@ -111,6 +129,7 @@ func (s *Service) Refresh(ctx context.Context) error {
 		return nil
 	}
 	s.running = true
+	s.lastStart = s.now()
 	s.mu.Unlock()
 
 	err := s.refresh(ctx)
@@ -191,21 +210,39 @@ func (s *Service) scoreAll(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	rows, err := s.Store.NeedScore(ctx, maxScoreAttempts, 200)
+	now := s.now()
+	rows, err := s.Store.NeedScore(ctx, maxScoreAttempts, now.Add(-s.Cfg.Limits.RetryAfter), 200)
 	if err != nil {
 		return 0, err
 	}
+	s.setNote("")
+	day := now.Format(time.DateOnly)
 	total := 0
-	for start := 0; start < len(rows); start += s.Cfg.Claude.BatchSize {
+	for start := 0; start < len(rows); {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
-		batch := rows[start:min(start+s.Cfg.Claude.BatchSize, len(rows))]
+		calls, sent, err := s.Store.Usage(ctx, day)
+		if err != nil {
+			return total, err
+		}
+		room := min(s.Cfg.Claude.BatchSize, s.Cfg.Limits.DailyStories-sent, len(rows)-start)
+		if calls >= s.Cfg.Limits.DailyCalls || room <= 0 {
+			left := len(rows) - start
+			log.Printf("[WARN] daily limit reached (%d calls, %d stories); %d stories wait for tomorrow", calls, sent, left)
+			s.setNote(fmt.Sprintf("daily limit reached; stories that wait for the next UTC day: %d", left))
+			break
+		}
+		batch := rows[start : start+room]
+		start += room
+		if err := s.Store.AddUsage(ctx, day, 1, len(batch)); err != nil {
+			return total, err
+		}
 		res, err := s.Scorer.Score(ctx, ScoreInput{Stories: batch, PastPicks: picks, PastRejects: rejects})
 		if err != nil {
 			log.Printf("[WARN] score batch of %d: %v", len(batch), err)
 			for _, row := range batch {
-				if serr := s.Store.SaveScoreError(ctx, row.ID, truncate(err.Error(), 300)); serr != nil {
+				if serr := s.Store.SaveScoreError(ctx, row.ID, truncate(err.Error(), 300), s.now()); serr != nil {
 					return total, serr
 				}
 			}
@@ -221,11 +258,17 @@ func (s *Service) scoreAll(ctx context.Context) (int, error) {
 		}
 		for _, row := range batch {
 			if !got[row.ID] {
-				if err := s.Store.SaveScoreError(ctx, row.ID, "missing from model answer"); err != nil {
+				if err := s.Store.SaveScoreError(ctx, row.ID, "missing from model answer", s.now()); err != nil {
 					return total, err
 				}
 			}
 		}
 	}
 	return total, nil
+}
+
+func (s *Service) setNote(note string) {
+	s.mu.Lock()
+	s.note = note
+	s.mu.Unlock()
 }

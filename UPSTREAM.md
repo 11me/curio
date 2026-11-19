@@ -9,7 +9,7 @@ stays in this repository and still builds as `cmd/newscope`.
 | Upstream branch | `master` |
 | Local branch | `main` |
 | Remote name | `upstream` (push is disabled) |
-| Recorded commit | `96b7469e` (chore(deps): bump testify to 1.11.1) |
+| Recorded commit | `96b7469c14c89c73c953d6f2ec51c6b9a5d9d1f3` (chore(deps): bump testify to 1.11.1) |
 | Last check date | 2026-11-19 |
 
 ## What is new here
@@ -39,7 +39,7 @@ modules. The Go module path stays `github.com/umputun/newscope` for the same rea
 
    ```sh
    git fetch upstream
-   git log --oneline 96b7469e..upstream/master
+   git log --oneline 96b7469c14c89c73c953d6f2ec51c6b9a5d9d1f3..upstream/master
    ```
 
 3. Merge on a branch and run the tests:

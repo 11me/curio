@@ -4,6 +4,9 @@
 package curio
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -24,20 +27,32 @@ type Config struct {
 	Days     int           `yaml:"days"`      // the list shows stories first seen in this many days
 	Cutoff   float64       `yaml:"cutoff"`    // default fit cutoff for clients
 	Extract  bool          `yaml:"extract"`   // fetch article text for the scorer
+	APIToken string        `yaml:"api_token"` // bearer token for the API, made on first run
 
 	Claude   ClaudeConfig `yaml:"claude"`
+	Limits   LimitsConfig `yaml:"limits"`
 	Bias     float64      `yaml:"bias"`
 	Criteria []Criterion  `yaml:"criteria"`
 }
 
 // ClaudeConfig controls the claude CLI calls.
 type ClaudeConfig struct {
-	Command   string        `yaml:"command"`    // path to the claude CLI
-	Model     string        `yaml:"model"`      // model alias, for example haiku
-	BatchSize int           `yaml:"batch_size"` // stories per call
-	Timeout   time.Duration `yaml:"timeout"`    // time limit of one call
-	TextChars int           `yaml:"text_chars"` // article text characters sent per story
-	Picks     int           `yaml:"picks"`      // recent Good and Bad titles sent as examples
+	Command   string        `yaml:"command"`        // path to the claude CLI
+	Model     string        `yaml:"model"`          // model alias, for example haiku
+	BatchSize int           `yaml:"batch_size"`     // stories per call
+	Timeout   time.Duration `yaml:"timeout"`        // time limit of one call
+	TextChars int           `yaml:"text_chars"`     // article text characters sent per story
+	Picks     int           `yaml:"picks"`          // recent Good and Bad titles sent as examples
+	MaxTurns  int           `yaml:"max_turns"`      // model turns per call (structured output needs 2)
+	MaxBudget float64       `yaml:"max_budget_usd"` // spend cap per call, in USD at API prices
+}
+
+// LimitsConfig caps how much of the subscription curio can use.
+type LimitsConfig struct {
+	DailyCalls   int           `yaml:"daily_calls"`   // claude CLI calls per UTC day
+	DailyStories int           `yaml:"daily_stories"` // stories sent to the model per UTC day
+	MinRefresh   time.Duration `yaml:"min_refresh"`   // shortest time between two refresh starts
+	RetryAfter   time.Duration `yaml:"retry_after"`   // wait before a failed story is sent again
 }
 
 // Criterion is one yes or no question with a weight.
@@ -68,8 +83,11 @@ func DefaultConfig() Config {
 			Timeout:   4 * time.Minute,
 			TextChars: 3000,
 			Picks:     20,
+			MaxTurns:  3,
+			MaxBudget: 0.25,
 		},
-		Bias: -2,
+		Limits: LimitsConfig{DailyCalls: 24, DailyStories: 200, MinRefresh: 5 * time.Minute, RetryAfter: 30 * time.Minute},
+		Bias:   -2,
 	}
 }
 
@@ -113,11 +131,26 @@ func (c Config) Validate() error {
 	if c.Days < 1 || c.KeepDays < c.Days {
 		return fmt.Errorf("days %d, keep_days %d: days must be 1 or more and not above keep_days", c.Days, c.KeepDays)
 	}
+	if c.APIToken != "" && len(c.APIToken) < 32 {
+		return fmt.Errorf("api_token: use 32 characters or more")
+	}
 	if c.Claude.Command == "" || c.Claude.Model == "" {
 		return fmt.Errorf("claude.command and claude.model are required")
 	}
 	if c.Claude.BatchSize < 1 || c.Claude.BatchSize > 30 {
 		return fmt.Errorf("claude.batch_size %d: use 1 to 30", c.Claude.BatchSize)
+	}
+	if c.Claude.MaxTurns < 2 || c.Claude.MaxTurns > 5 {
+		return fmt.Errorf("claude.max_turns %d: use 2 to 5", c.Claude.MaxTurns)
+	}
+	if c.Claude.MaxBudget <= 0 || c.Claude.MaxBudget > 5 {
+		return fmt.Errorf("claude.max_budget_usd %v: use more than 0 and at most 5", c.Claude.MaxBudget)
+	}
+	if c.Limits.DailyCalls < 1 || c.Limits.DailyStories < 1 {
+		return fmt.Errorf("limits.daily_calls and limits.daily_stories must be 1 or more")
+	}
+	if c.Limits.MinRefresh < time.Minute || c.Limits.RetryAfter < time.Minute {
+		return fmt.Errorf("limits.min_refresh and limits.retry_after must be one minute or more")
 	}
 	if len(c.Criteria) == 0 || len(c.Criteria) > 20 {
 		return fmt.Errorf("criteria: give 1 to 20 criteria")
@@ -136,4 +169,37 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// EnsureAPIToken makes a random API token when the config has none, appends
+// it to the config file, and keeps the file private (mode 0600).
+func EnsureAPIToken(path string, cfg *Config) (created bool, err error) {
+	if cfg.APIToken == "" {
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			return false, fmt.Errorf("make token: %w", err)
+		}
+		token := hex.EncodeToString(buf)
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // path comes from the operator
+		if err != nil {
+			return false, fmt.Errorf("open config: %w", err)
+		}
+		_, werr := fmt.Fprintf(f, "\n# API token for the bb plugin, made by curio. Keep this file private.\napi_token: %s\n", token)
+		cerr := f.Close()
+		if werr != nil || cerr != nil {
+			return false, fmt.Errorf("save token: %w", errors.Join(werr, cerr))
+		}
+		cfg.APIToken = token
+		created = true
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return created, fmt.Errorf("stat config: %w", err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return created, fmt.Errorf("make config private: %w", err)
+		}
+	}
+	return created, nil
 }

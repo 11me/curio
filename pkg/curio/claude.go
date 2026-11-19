@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -17,7 +18,8 @@ import (
 type ClaudeScorer struct {
 	Cfg      ClaudeConfig
 	Criteria []Criterion
-	Run      RunFunc // runs the CLI; nil means exec
+	Run      RunFunc         // runs the CLI; nil means exec
+	Environ  func() []string // process environment; nil means os.Environ
 }
 
 // RunFunc runs a command with stdin and returns its stdout.
@@ -50,6 +52,14 @@ func (c *ClaudeScorer) Score(ctx context.Context, in ScoreInput) ([]Scored, erro
 	if len(in.Stories) == 0 {
 		return nil, nil
 	}
+	environ := c.Environ
+	if environ == nil {
+		environ = os.Environ
+	}
+	env, err := subscriptionEnv(environ())
+	if err != nil {
+		return nil, err
+	}
 	prompt, err := c.prompt(in)
 	if err != nil {
 		return nil, err
@@ -65,12 +75,16 @@ func (c *ClaudeScorer) Score(ctx context.Context, in ScoreInput) ([]Scored, erro
 		"--setting-sources", "",
 		"--disable-slash-commands",
 		"--no-session-persistence",
+		"--max-turns", strconv.Itoa(c.Cfg.MaxTurns),
+		"--max-budget-usd", strconv.FormatFloat(c.Cfg.MaxBudget, 'f', -1, 64),
 	}
 	callCtx, cancel := context.WithTimeout(ctx, c.Cfg.Timeout)
 	defer cancel()
 	run := c.Run
 	if run == nil {
-		run = execRun
+		run = func(ctx context.Context, name string, args []string, stdin []byte) ([]byte, error) {
+			return execRun(ctx, name, args, stdin, env)
+		}
 	}
 	out, err := run(callCtx, c.Cfg.Command, args, prompt)
 	if err != nil {
@@ -171,7 +185,7 @@ func (c *ClaudeScorer) parse(out []byte, batch []StoryRow) ([]Scored, error) {
 	return out2, nil
 }
 
-func execRun(ctx context.Context, name string, args []string, stdin []byte) ([]byte, error) {
+func execRun(ctx context.Context, name string, args []string, stdin []byte, env []string) ([]byte, error) {
 	dir, err := os.MkdirTemp("", "curio-claude-")
 	if err != nil {
 		return nil, fmt.Errorf("temp dir: %w", err)
@@ -181,7 +195,7 @@ func execRun(ctx context.Context, name string, args []string, stdin []byte) ([]b
 	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // command and model come from the operator's config
 	cmd.Dir = dir
 	cmd.Stdin = bytes.NewReader(stdin)
-	cmd.Env = subscriptionEnv(os.Environ())
+	cmd.Env = env
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -194,16 +208,24 @@ func execRun(ctx context.Context, name string, args []string, stdin []byte) ([]b
 	return stdout.Bytes(), nil
 }
 
-// subscriptionEnv drops API key variables so the CLI uses its own login.
-func subscriptionEnv(env []string) []string {
+// subscriptionEnv drops API key and endpoint variables so the CLI uses its
+// own login, and refuses to run when a cloud provider is turned on, because
+// those calls bill a cloud account instead of the subscription.
+func subscriptionEnv(env []string) ([]string, error) {
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "ANTHROPIC_API_KEY=") || strings.HasPrefix(kv, "ANTHROPIC_AUTH_TOKEN=") {
+		name, value, _ := strings.Cut(kv, "=")
+		switch name {
+		case "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL":
 			continue
+		case "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY":
+			if v := strings.ToLower(strings.TrimSpace(value)); v != "" && v != "0" && v != "false" {
+				return nil, fmt.Errorf("%s is on: curio uses only the Claude subscription, not a cloud provider; unset it", name)
+			}
 		}
 		out = append(out, kv)
 	}
-	return out
+	return out, nil
 }
 
 func truncate(s string, n int) string {
@@ -226,4 +248,10 @@ func nonNil(s []string) []string {
 	return s
 }
 
-const resultSchema = `{"type":"object","additionalProperties":false,"required":["stories"],"properties":{"stories":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","summary","answers"],"properties":{"id":{"type":"integer"},"summary":{"type":"string"},"answers":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["criterion","answer","note"],"properties":{"criterion":{"type":"string"},"answer":{"type":"number","minimum":0,"maximum":1},"note":{"type":"string"}}}}}}}}}`
+const resultSchema = `{"type":"object","additionalProperties":false,"required":["stories"],"properties":{"stories":{"type":"array","maxItems":30,"items":{"type":"object","additionalProperties":false,"required":["id","summary","answers"],"properties":{"id":{"type":"integer"},"summary":{"type":"string","maxLength":800},"answers":{"type":"array","maxItems":20,"items":{"type":"object","additionalProperties":false,"required":["criterion","answer","note"],"properties":{"criterion":{"type":"string","maxLength":40},"answer":{"type":"number","minimum":0,"maximum":1},"note":{"type":"string","maxLength":120}}}}}}}}}`
+
+// CheckSubscriptionEnv reports an environment that would bill a cloud account.
+func CheckSubscriptionEnv(env []string) error {
+	_, err := subscriptionEnv(env)
+	return err
+}

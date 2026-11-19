@@ -24,7 +24,7 @@ func TestClaudeScorer_Score(t *testing.T) {
 				{"criterion":"unknown","answer":1,"note":"x"}]},
 			{"id":99,"summary":"not in batch","answers":[]}]}}`), nil
 	}
-	sc := &ClaudeScorer{Cfg: DefaultConfig().Claude, Criteria: testCriteria, Run: run}
+	sc := &ClaudeScorer{Cfg: DefaultConfig().Claude, Criteria: testCriteria, Run: run, Environ: func() []string { return nil }}
 	sc.Cfg.TextChars = 5
 	res, err := sc.Score(context.Background(), ScoreInput{
 		Stories:   []StoryRow{{ID: 1, Title: "Rust 1.100", Domain: "blog.rust-lang.org", ArticleText: "long article"}, {ID: 2, Title: "Two", HNText: "hn text"}},
@@ -42,6 +42,10 @@ func TestClaudeScorer_Score(t *testing.T) {
 	assert.Contains(t, args, "--model haiku")
 	assert.Contains(t, args, "--tools  --strict-mcp-config")
 	assert.Contains(t, args, "--no-session-persistence")
+	assert.Contains(t, args, "--max-turns 3")
+	assert.Contains(t, args, "--max-budget-usd 0.25")
+	assert.Contains(t, args, `"maxLength":800`, "the schema limits the summary")
+	assert.Contains(t, args, `"maxItems":30`, "the schema limits the story count")
 	stories := gotPrompt["stories"].([]any)
 	assert.Equal(t, "long …", stories[0].(map[string]any)["text"], "text is cut to text_chars")
 	assert.Equal(t, "hn te…", stories[1].(map[string]any)["text"], "HN text is used without article text")
@@ -64,7 +68,7 @@ func TestClaudeScorer_Errors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sc := &ClaudeScorer{Cfg: DefaultConfig().Claude, Criteria: testCriteria,
+			sc := &ClaudeScorer{Cfg: DefaultConfig().Claude, Criteria: testCriteria, Environ: func() []string { return nil },
 				Run: func(context.Context, string, []string, []byte) ([]byte, error) { return []byte(tt.out), tt.err }}
 			res, err := sc.Score(context.Background(), ScoreInput{Stories: []StoryRow{{ID: 1, Title: "t"}}})
 			if tt.want == "" {
@@ -79,6 +83,23 @@ func TestClaudeScorer_Errors(t *testing.T) {
 }
 
 func TestSubscriptionEnv(t *testing.T) {
-	env := subscriptionEnv([]string{"PATH=/bin", "ANTHROPIC_API_KEY=x", "ANTHROPIC_AUTH_TOKEN=y", "HOME=/h"})
-	assert.Equal(t, []string{"PATH=/bin", "HOME=/h"}, env)
+	env, err := subscriptionEnv([]string{"PATH=/bin", "ANTHROPIC_API_KEY=x", "ANTHROPIC_AUTH_TOKEN=y", "ANTHROPIC_BASE_URL=http://proxy", "HOME=/h", "CLAUDE_CODE_USE_BEDROCK=0"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"PATH=/bin", "HOME=/h", "CLAUDE_CODE_USE_BEDROCK=0"}, env)
+
+	for _, kv := range []string{"CLAUDE_CODE_USE_BEDROCK=1", "CLAUDE_CODE_USE_VERTEX=true", "CLAUDE_CODE_USE_FOUNDRY=1"} {
+		_, err := subscriptionEnv([]string{"PATH=/bin", kv})
+		require.Error(t, err, kv)
+		assert.Contains(t, err.Error(), "cloud provider")
+	}
+}
+
+func TestClaudeScorer_RefusesCloudProvider(t *testing.T) {
+	called := false
+	sc := &ClaudeScorer{Cfg: DefaultConfig().Claude, Criteria: testCriteria,
+		Environ: func() []string { return []string{"CLAUDE_CODE_USE_BEDROCK=1"} },
+		Run:     func(context.Context, string, []string, []byte) ([]byte, error) { called = true; return nil, nil }}
+	_, err := sc.Score(context.Background(), ScoreInput{Stories: []StoryRow{{ID: 1, Title: "t"}}})
+	require.Error(t, err)
+	assert.False(t, called, "no call is made")
 }

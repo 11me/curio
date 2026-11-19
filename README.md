@@ -47,6 +47,31 @@ Each refresh reads the front page (`front_n` stories), gets the article text,
 and sends new stories to the model in batches (`claude.batch_size` stories in
 one call). Known stories only get new points and comment counts.
 
+On the first run curio adds a random `api_token` to `curio.yml` and sets the
+file mode to 0600. Give the token to the bb plugin once:
+
+```sh
+bb plugin config curio set apiToken <the api_token value from curio.yml>
+```
+
+### Limits
+
+`limits` in `curio.yml` caps the use of your subscription: `daily_calls` and
+`daily_stories` per UTC day, `min_refresh` between two refreshes (also for
+Refresh now), and `retry_after` before a failed story is sent again. Each CLI
+call also has `claude.max_turns` and `claude.max_budget_usd`. curio refuses to
+run when `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` or
+`CLAUDE_CODE_USE_FOUNDRY` is on, and drops `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` from the CLI environment.
+
+### Article text
+
+curio fetches article text only over http and https, from public addresses.
+It resolves each host itself and refuses loopback, private, link-local (cloud
+metadata), carrier NAT, multicast and other special addresses, also after
+redirects. It reads at most 3 MB in 30 seconds and does not use a proxy. Only
+the extracted text of a public page goes to the model.
+
 ### Fit
 
 For each criterion the model answers how likely the answer is yes (0 to 1) and
@@ -63,11 +88,12 @@ into later prompts as `past_picks` and `past_rejects`.
 | GET | `/api/v1/stories/{id}` | Summary, the top three reasons and all criteria rows |
 | POST | `/api/v1/stories/{id}/mark` | `{"mark":"good"}`, `"bad"` or `"none"` |
 | POST | `/api/v1/stories/{id}/task` | `{"key":"PER-12"}` records a task made from the story |
-| POST | `/api/v1/refresh` | `{}` starts a refresh |
+| POST | `/api/v1/refresh` | `{}` starts a refresh; 429 within `min_refresh` |
 | GET | `/api/v1/status` | Refresh state |
 
-The API accepts only calls with a loopback `Host`, no `Origin` header, and a
-JSON body on POST. Browser pages cannot call it.
+Every call needs `Authorization: Bearer <api_token>`. The API also refuses a
+non-loopback `Host`, any `Origin` header, and POST bodies that are not JSON.
+Writes are POST only. Web pages and other users on the Mac cannot call it.
 
 ## Basic Usage
 

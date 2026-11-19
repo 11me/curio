@@ -16,6 +16,14 @@ claude:
   timeout: 4m
   text_chars: 3000       # article text sent per story
   picks: 20              # recent Good and Bad titles sent as examples
+  max_turns: 3           # model turns per call
+  max_budget_usd: 0.25   # spend cap per call (API prices; the subscription is used)
+
+limits:
+  daily_calls: 24        # claude CLI calls per UTC day
+  daily_stories: 200     # stories sent to the model per UTC day
+  min_refresh: 5m        # shortest time between two refreshes, also for Refresh now
+  retry_after: 30m       # wait before a failed story is sent again (3 tries)
 
 # fit = 1 / (1 + e^-(bias + sum(weight * answer))), answer is the model's 0 to 1 "yes".
 bias: -2.0

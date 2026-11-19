@@ -16,7 +16,6 @@ import (
 	log "github.com/go-pkgz/lgr"
 	"github.com/jessevdk/go-flags"
 
-	"github.com/umputun/newscope/pkg/content"
 	"github.com/umputun/newscope/pkg/curio"
 	"github.com/umputun/newscope/pkg/hn"
 )
@@ -60,6 +59,17 @@ func run(ctx context.Context, o opts) error {
 	if o.Data != "" {
 		cfg.DataDir = o.Data
 	}
+	created, err := curio.EnsureAPIToken(o.Config, &cfg)
+	if err != nil {
+		return err
+	}
+	if created {
+		log.Printf("[INFO] made an API token in %s (api_token). Give it to the bb plugin: "+
+			"bb plugin config curio set apiToken <the api_token value>", o.Config)
+	}
+	if err := curio.CheckSubscriptionEnv(os.Environ()); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return fmt.Errorf("data folder: %w", err)
 	}
@@ -73,7 +83,7 @@ func run(ctx context.Context, o opts) error {
 		Cfg:       cfg,
 		Store:     store,
 		HN:        hn.NewClient(20 * time.Second),
-		Extractor: textExtractor{x: newExtractor()},
+		Extractor: curio.NewPageFetcher(30*time.Second, 3<<20),
 		Scorer:    &curio.ClaudeScorer{Cfg: cfg.Claude, Criteria: cfg.Criteria},
 	}
 	if o.Once {
@@ -82,7 +92,7 @@ func run(ctx context.Context, o opts) error {
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           (&curio.API{Svc: svc}).Handler(),
+		Handler:           (&curio.API{Svc: svc, Token: cfg.APIToken}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -99,20 +109,4 @@ func run(ctx context.Context, o opts) error {
 		return fmt.Errorf("server: %w", err)
 	}
 	return nil
-}
-
-func newExtractor() *content.HTTPExtractor {
-	x := content.NewHTTPExtractor(20*time.Second, "Mozilla/5.0 (compatible; curio/1.0)")
-	x.SetRetryConfig(1, time.Second, time.Second, 0)
-	return x
-}
-
-type textExtractor struct{ x *content.HTTPExtractor }
-
-func (t textExtractor) Text(ctx context.Context, url string) (string, error) {
-	res, err := t.x.Extract(ctx, url)
-	if err != nil {
-		return "", fmt.Errorf("extract: %w", err)
-	}
-	return res.Content, nil
 }
