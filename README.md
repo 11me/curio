@@ -1,3 +1,10 @@
+> **curio** is a personal copy of newscope. It adds a Hacker News curator:
+> `cmd/curio` reads the front page with points and comments, scores each story
+> against weighted yes/no criteria with the `claude` CLI (your Claude login, no
+> API key), and serves a small JSON API on `127.0.0.1` for a bb plugin view.
+> See [curio](#curio) below and [UPSTREAM.md](UPSTREAM.md). Everything else in
+> this README is newscope and works as before.
+
 <div align="center">
   <img src="server/static/img/full-logo.svg" alt="Newscope" width="425">
   <br>
@@ -20,6 +27,47 @@ In addition to intelligent feed curation, newscope provides:
 - Modern web UI with multiple view modes
 - Real-time feed updates
 - Full-text search with partial word matching
+
+## curio
+
+curio runs on your own computer and listens on a loopback address only. It
+has no login.
+
+1. Install the [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) and log in once with `claude`.
+2. Copy `curio.example.yml` to `curio.yml` and change the criteria if you want.
+3. Run it:
+
+   ```sh
+   go run ./cmd/curio -c curio.yml            # server on 127.0.0.1:8090
+   go run ./cmd/curio -c curio.yml --once     # one refresh, then exit
+   go run ./cmd/curio -c curio.yml --data /tmp/curio-test   # other data folder
+   ```
+
+Each refresh reads the front page (`front_n` stories), gets the article text,
+and sends new stories to the model in batches (`claude.batch_size` stories in
+one call). Known stories only get new points and comment counts.
+
+### Fit
+
+For each criterion the model answers how likely the answer is yes (0 to 1) and
+gives a short reason. The fit is `1 / (1 + e^-(bias + sum(weight * answer)))`.
+Weights and bias come from `curio.yml` and apply at read time, so a change
+needs only a restart, not a new scoring run. Stories you mark Good or Bad go
+into later prompts as `past_picks` and `past_rejects`.
+
+### API
+
+| Method | Path | Body or query |
+| --- | --- | --- |
+| GET | `/api/v1/stories` | `min_fit` (0 to 1), `q`, `sort` (`fit`, `date`, `points`), `marks` (`all`, `hide`, `good`, `bad`), `limit` |
+| GET | `/api/v1/stories/{id}` | Summary, the top three reasons and all criteria rows |
+| POST | `/api/v1/stories/{id}/mark` | `{"mark":"good"}`, `"bad"` or `"none"` |
+| POST | `/api/v1/stories/{id}/task` | `{"key":"PER-12"}` records a task made from the story |
+| POST | `/api/v1/refresh` | `{}` starts a refresh |
+| GET | `/api/v1/status` | Refresh state |
+
+The API accepts only calls with a loopback `Host`, no `Origin` header, and a
+JSON body on POST. Browser pages cannot call it.
 
 ## Basic Usage
 

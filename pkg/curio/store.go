@@ -1,0 +1,294 @@
+package curio
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	_ "modernc.org/sqlite" // pure Go SQLite driver
+
+	"github.com/umputun/newscope/pkg/hn"
+)
+
+// Store keeps stories, scores and marks in SQLite.
+type Store struct {
+	db *sqlx.DB
+}
+
+// Mark values.
+const (
+	MarkNone = ""
+	MarkGood = "good"
+	MarkBad  = "bad"
+)
+
+// ErrNotFound is returned for an unknown story.
+var ErrNotFound = errors.New("story not found")
+
+const schema = `
+CREATE TABLE IF NOT EXISTS stories (
+	id INTEGER PRIMARY KEY,
+	title TEXT NOT NULL,
+	url TEXT NOT NULL,
+	domain TEXT NOT NULL DEFAULT '',
+	author TEXT NOT NULL DEFAULT '',
+	points INTEGER NOT NULL DEFAULT 0,
+	comments INTEGER NOT NULL DEFAULT 0,
+	posted_at DATETIME NOT NULL,
+	first_seen DATETIME NOT NULL,
+	last_seen DATETIME NOT NULL,
+	rank INTEGER NOT NULL DEFAULT 0,
+	hn_text TEXT NOT NULL DEFAULT '',
+	article_text TEXT NOT NULL DEFAULT '',
+	extracted_at DATETIME,
+	extract_error TEXT NOT NULL DEFAULT '',
+	summary TEXT NOT NULL DEFAULT '',
+	answers TEXT NOT NULL DEFAULT '[]',
+	scored_at DATETIME,
+	score_error TEXT NOT NULL DEFAULT '',
+	score_attempts INTEGER NOT NULL DEFAULT 0,
+	mark TEXT NOT NULL DEFAULT '',
+	marked_at DATETIME,
+	task_key TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_stories_first_seen ON stories(first_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_stories_mark ON stories(mark, marked_at DESC);
+`
+
+// OpenStore opens or creates the database file.
+func OpenStore(ctx context.Context, path string) (*Store, error) {
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate"
+	db, err := sqlx.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("create schema: %w", err)
+	}
+	return &Store{db: db}, nil
+}
+
+// Close closes the database.
+func (s *Store) Close() error { return s.db.Close() }
+
+// StoryRow is a stored story.
+type StoryRow struct {
+	ID            int64        `db:"id"`
+	Title         string       `db:"title"`
+	URL           string       `db:"url"`
+	Domain        string       `db:"domain"`
+	Author        string       `db:"author"`
+	Points        int          `db:"points"`
+	Comments      int          `db:"comments"`
+	PostedAt      time.Time    `db:"posted_at"`
+	FirstSeen     time.Time    `db:"first_seen"`
+	LastSeen      time.Time    `db:"last_seen"`
+	Rank          int          `db:"rank"`
+	HNText        string       `db:"hn_text"`
+	ArticleText   string       `db:"article_text"`
+	ExtractedAt   sql.NullTime `db:"extracted_at"`
+	ExtractError  string       `db:"extract_error"`
+	Summary       string       `db:"summary"`
+	AnswersJSON   string       `db:"answers"`
+	ScoredAt      sql.NullTime `db:"scored_at"`
+	ScoreError    string       `db:"score_error"`
+	ScoreAttempts int          `db:"score_attempts"`
+	Mark          string       `db:"mark"`
+	MarkedAt      sql.NullTime `db:"marked_at"`
+	TaskKey       string       `db:"task_key"`
+}
+
+// Answers decodes the stored answers.
+func (r StoryRow) Answers() []Answer {
+	var out []Answer
+	if err := json.Unmarshal([]byte(r.AnswersJSON), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// UpsertFront saves the current front page. New stories are added; known
+// stories get fresh points, comments and rank. Stories that left the front
+// page keep their last numbers and get rank 0.
+func (s *Store) UpsertFront(ctx context.Context, stories []hn.Story, now time.Time) (added int, err error) {
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `UPDATE stories SET rank = 0 WHERE rank != 0`); err != nil {
+		return 0, fmt.Errorf("reset rank: %w", err)
+	}
+	for _, st := range stories {
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO stories (id, title, url, domain, author, points, comments, posted_at, first_seen, last_seen, rank, hn_text)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO NOTHING`,
+			st.ID, st.Title, st.URL, Domain(st.URL), st.By, st.Points, st.Comments, st.Posted, now, now, st.Rank, st.Text)
+		if err != nil {
+			return 0, fmt.Errorf("insert story %d: %w", st.ID, err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			added++
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE stories SET title = ?, points = ?, comments = ?, rank = ?, last_seen = ? WHERE id = ?`,
+			st.Title, st.Points, st.Comments, st.Rank, now, st.ID); err != nil {
+			return 0, fmt.Errorf("update story %d: %w", st.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+	return added, nil
+}
+
+// NeedText returns stories that have no article text attempt yet.
+func (s *Store) NeedText(ctx context.Context, limit int) ([]StoryRow, error) {
+	var rows []StoryRow
+	err := s.db.SelectContext(ctx, &rows,
+		`SELECT * FROM stories WHERE extracted_at IS NULL ORDER BY first_seen DESC, rank LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select stories without text: %w", err)
+	}
+	return rows, nil
+}
+
+// SaveText stores the article text or the extraction error.
+func (s *Store) SaveText(ctx context.Context, id int64, text, extractErr string, now time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE stories SET article_text = ?, extract_error = ?, extracted_at = ? WHERE id = ?`, text, extractErr, now, id)
+	if err != nil {
+		return fmt.Errorf("save text %d: %w", id, err)
+	}
+	return nil
+}
+
+// NeedScore returns unscored stories with fewer than maxAttempts failed tries,
+// the newest first.
+func (s *Store) NeedScore(ctx context.Context, maxAttempts, limit int) ([]StoryRow, error) {
+	var rows []StoryRow
+	err := s.db.SelectContext(ctx, &rows, `
+		SELECT * FROM stories WHERE scored_at IS NULL AND score_attempts < ?
+		ORDER BY first_seen DESC, rank LIMIT ?`, maxAttempts, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select unscored stories: %w", err)
+	}
+	return rows, nil
+}
+
+// SaveScore stores a summary and answers.
+func (s *Store) SaveScore(ctx context.Context, id int64, summary string, answers []Answer, now time.Time) error {
+	data, err := json.Marshal(answers)
+	if err != nil {
+		return fmt.Errorf("encode answers: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE stories SET summary = ?, answers = ?, scored_at = ?, score_error = '', score_attempts = score_attempts + 1
+		WHERE id = ?`, summary, string(data), now, id)
+	if err != nil {
+		return fmt.Errorf("save score %d: %w", id, err)
+	}
+	return nil
+}
+
+// SaveScoreError records a failed scoring attempt.
+func (s *Store) SaveScoreError(ctx context.Context, id int64, msg string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE stories SET score_error = ?, score_attempts = score_attempts + 1 WHERE id = ?`, msg, id)
+	if err != nil {
+		return fmt.Errorf("save score error %d: %w", id, err)
+	}
+	return nil
+}
+
+// Since returns stories first seen at or after t, plus all marked stories in that window.
+func (s *Store) Since(ctx context.Context, t time.Time) ([]StoryRow, error) {
+	var rows []StoryRow
+	if err := s.db.SelectContext(ctx, &rows, `SELECT * FROM stories WHERE first_seen >= ?`, t); err != nil {
+		return nil, fmt.Errorf("select stories: %w", err)
+	}
+	return rows, nil
+}
+
+// Get returns one story.
+func (s *Store) Get(ctx context.Context, id int64) (StoryRow, error) {
+	var row StoryRow
+	err := s.db.GetContext(ctx, &row, `SELECT * FROM stories WHERE id = ?`, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return row, ErrNotFound
+	}
+	if err != nil {
+		return row, fmt.Errorf("get story %d: %w", id, err)
+	}
+	return row, nil
+}
+
+// SetMark sets Good, Bad or no mark.
+func (s *Store) SetMark(ctx context.Context, id int64, mark string, now time.Time) error {
+	if mark != MarkNone && mark != MarkGood && mark != MarkBad {
+		return fmt.Errorf("unknown mark %q", mark)
+	}
+	var at any = now
+	if mark == MarkNone {
+		at = nil
+	}
+	return s.update(ctx, id, `UPDATE stories SET mark = ?, marked_at = ? WHERE id = ?`, mark, at, id)
+}
+
+// SetTask records the task made from a story.
+func (s *Store) SetTask(ctx context.Context, id int64, key string) error {
+	return s.update(ctx, id, `UPDATE stories SET task_key = ? WHERE id = ?`, key, id)
+}
+
+func (s *Store) update(ctx context.Context, id int64, query string, args ...any) error {
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("update story %d: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RecentMarked returns the titles of the newest stories with the given mark.
+func (s *Store) RecentMarked(ctx context.Context, mark string, limit int) ([]string, error) {
+	var titles []string
+	err := s.db.SelectContext(ctx, &titles,
+		`SELECT title FROM stories WHERE mark = ? ORDER BY marked_at DESC LIMIT ?`, mark, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select marked titles: %w", err)
+	}
+	return titles, nil
+}
+
+// Cleanup deletes unmarked stories first seen before t that have no task.
+func (s *Store) Cleanup(ctx context.Context, t time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM stories WHERE first_seen < ? AND mark = '' AND task_key = ''`, t)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// Domain returns the host of a link without "www.".
+func Domain(link string) string {
+	u, err := url.Parse(link)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(strings.ToLower(u.Hostname()), "www.")
+}

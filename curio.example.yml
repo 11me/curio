@@ -1,0 +1,58 @@
+# curio configuration. Copy to curio.yml (ignored by git) and change it.
+# Relative paths are relative to this file.
+listen: 127.0.0.1:8090   # loopback only: curio has no login
+data_dir: ./var/curio    # SQLite database folder
+interval: 30m            # front page refresh
+front_n: 30              # stories read from the front page
+days: 7                  # the list shows stories first seen in this many days
+keep_days: 14            # unmarked stories older than this are deleted
+cutoff: 0.5              # default fit cutoff for clients
+extract: true            # fetch article text for better summaries
+
+claude:
+  command: claude        # the claude CLI, logged in with your subscription
+  model: haiku           # small model; one call per batch
+  batch_size: 10
+  timeout: 4m
+  text_chars: 3000       # article text sent per story
+  picks: 20              # recent Good and Bad titles sent as examples
+
+# fit = 1 / (1 + e^-(bias + sum(weight * answer))), answer is the model's 0 to 1 "yes".
+bias: -2.0
+criteria:
+  - id: past_picks
+    label: Like stories you marked Good
+    question: Is the story similar in topic and kind to the stories in past_picks?
+    weight: 2.2
+  - id: past_rejects
+    label: Like stories you marked Bad
+    question: Is the story similar in topic and kind to the stories in past_rejects?
+    weight: -2.0
+  - id: dev_release
+    label: A release of a developer tool
+    question: Is the story a release or major update of a programming language, framework, runtime, editor or other developer tool?
+    weight: 1.9
+  - id: deep_tech
+    label: A deep technical write-up
+    question: Is the story a technical write-up with real engineering detail (systems, databases, networking, security, performance)?
+    weight: 1.8
+  - id: infra
+    label: Infrastructure and self-hosting
+    question: Is the story about Kubernetes, cloud infrastructure, Linux, networking or self-hosting?
+    weight: 1.4
+  - id: ai_tools
+    label: AI models and coding agents
+    question: Is the story about a new AI model, AI agent or AI coding tool, or a notable change to one?
+    weight: 1.2
+  - id: big_tech
+    label: Big tech news for developers
+    question: Is the story news from a big tech company that matters to software developers (a launch, an acquisition, a policy change or a major outage)?
+    weight: 1.0
+  - id: side_project
+    label: A small side project
+    question: Is the story a small personal side project, a Show HN demo, a hardware hobby build or an announcement of a niche library?
+    weight: -1.3
+  - id: off_topic
+    label: Politics or business drama
+    question: Is the story mainly about politics, business drama or culture war, with little technical content?
+    weight: -1.5
