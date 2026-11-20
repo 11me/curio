@@ -42,10 +42,13 @@ func TestStore_ReadState(t *testing.T) {
 	assert.True(t, two.ReadAt.Valid)
 	assert.True(t, two.ReadAt.Time.Equal(t0.Add(time.Minute)))
 
-	// mark all read up to a time: story 4 came later and stays unread
-	n, err := st.MarkAllRead(ctx, t0.Add(time.Hour), t0.Add(3*time.Hour))
+	// mark read a set of stories: story 4 is not in the set and stays unread
+	n, err := st.MarkRead(ctx, []int64{1, 2, 3}, t0.Add(3*time.Hour))
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), n, "stories 1 and 3; story 2 was read already")
+	n, err = st.MarkRead(ctx, nil, t0)
+	require.NoError(t, err)
+	assert.Zero(t, n)
 	two, err = st.Get(ctx, 2)
 	require.NoError(t, err)
 	assert.True(t, two.ReadAt.Time.Equal(t0.Add(time.Minute)), "mark all read keeps older read times")
@@ -180,14 +183,35 @@ func TestAPI_ReadState(t *testing.T) {
 	_, out = do(t, h, http.MethodPost, "/api/v1/stories/2/mark", `{"mark":"good"}`, nil)
 	assert.Equal(t, "2026-11-19T13:00:00Z", out["read_at"])
 
-	// mark all read up to a time: a story first seen later stays unread
-	_, err := svc.Store.UpsertFront(context.Background(), front(1, 2, 3, 4), t0.Add(2*time.Hour))
+	// story 4 comes after the list time; story 5 is older than the 7 days of the list
+	ctx := context.Background()
+	_, err := svc.Store.UpsertFront(ctx, front(5), t0.AddDate(0, 0, -8))
 	require.NoError(t, err)
+	_, err = svc.Store.UpsertFront(ctx, front(1, 2, 3, 4), t0.Add(2*time.Hour))
+	require.NoError(t, err)
+
+	// the unread count follows min_fit, like the new count: stories 1, 3 and 4 are unread, only 1 is at 0.5 or above
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories", "", nil)
+	assert.InDelta(t, 3, out["unread"], 0)
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?min_fit=0.5", "", nil)
+	assert.InDelta(t, 1, out["unread"], 0)
+
+	// mark all read reads only what the list can show: up to the time, in the 7 days, at or above min_fit
+	rec, out = do(t, h, http.MethodPost, "/api/v1/read", `{"before":"2026-11-19T13:00:00Z","min_fit":0.5}`, nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.InDelta(t, 1, out["marked"], 0, "story 1; story 3 is not scored")
 	rec, out = do(t, h, http.MethodPost, "/api/v1/read", `{"before":"2026-11-19T13:00:00Z"}`, nil)
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.InDelta(t, 2, out["marked"], 0, "stories 1 and 3")
+	assert.InDelta(t, 1, out["marked"], 0, "story 3; story 4 came later and story 5 is too old")
 	_, out = do(t, h, http.MethodGet, "/api/v1/stories?read=unread", "", nil)
 	assert.Equal(t, []float64{4}, ids(out))
+	five, err := svc.Store.Get(ctx, 5)
+	require.NoError(t, err)
+	assert.False(t, five.ReadAt.Valid, "a story older than the list stays unread, so the cleanup can remove it")
+	for _, body := range []string{`{"before":"2026-11-19T13:00:00Z","min_fit":2}`, `{"before":"2026-11-19T13:00:00Z","min_fit":-1}`} {
+		rec, _ = do(t, h, http.MethodPost, "/api/v1/read", body, nil)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, body)
+	}
 	rec, _ = do(t, h, http.MethodPost, "/api/v1/read", `{}`, nil)
 	assert.Equal(t, http.StatusBadRequest, rec.Code, "before is required")
 	rec, _ = do(t, h, http.MethodPost, "/api/v1/read", `{"before":"soon"}`, nil)
