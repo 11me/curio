@@ -331,6 +331,17 @@ func (s *Store) MarkRead(ctx context.Context, ids []int64, now time.Time) (int64
 	return n, nil
 }
 
+// UnreadReadAt makes unread the stories with exactly this read time and
+// returns how many it changed. Mark all read gives all its stories one time.
+func (s *Store) UnreadReadAt(ctx context.Context, at time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE stories SET read_at = NULL WHERE read_at = ?`, at.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("undo mark all read: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // Visit records a visit of a client and returns the end of its previous
 // visit (nil for the first one). Calls less than visitGap apart are one visit.
 func (s *Store) Visit(ctx context.Context, client string, now time.Time) (*time.Time, error) {

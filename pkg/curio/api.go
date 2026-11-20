@@ -63,6 +63,8 @@ type ListResponse struct {
 	Bad       int        `json:"bad"`
 	Unscored  int        `json:"unscored"`
 	Unread    int        `json:"unread"` // unread stories at or above min_fit
+	Above     int        `json:"above"`  // stories at or above min_fit, read or not
+	Below     int        `json:"below"`  // scored stories below min_fit that pass the other filters
 	New       int        `json:"new"`    // new stories at or above min_fit
 	Since     time.Time  `json:"since"`
 	AsOf      time.Time  `json:"as_of"`      // server time of this list; use it for as_of and Mark all read
@@ -83,6 +85,13 @@ type listQuery struct {
 	after  *ListItem  // cursor: the sort fields and id of the last story of the previous page
 	search string
 	client string
+}
+
+// ReadAllResponse is the answer to Mark all read.
+type ReadAllResponse struct {
+	Marked int64     `json:"marked"`
+	IDs    []int64   `json:"ids"`     // the stories that the call read
+	ReadAt time.Time `json:"read_at"` // their read time; send it to /api/v1/read/undo
 }
 
 // VisitResponse is the answer to a visit.
@@ -107,6 +116,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/stories/{id}/task", a.task)
 	mux.HandleFunc("POST /api/v1/stories/{id}/read", a.read)
 	mux.HandleFunc("POST /api/v1/read", a.readAll)
+	mux.HandleFunc("POST /api/v1/read/undo", a.undoReadAll)
 	mux.HandleFunc("POST /api/v1/visit", a.visit)
 	mux.HandleFunc("POST /api/v1/refresh", a.refresh)
 	return guard(a.Token, mux)
@@ -192,6 +202,13 @@ func (a *API) list(w http.ResponseWriter, r *http.Request) {
 		}
 		if item.New && fitAtLeast(item, lq.minFit) {
 			resp.New++
+		}
+		if fitAtLeast(item, lq.minFit) {
+			resp.Above++
+		}
+		if item.Fit != nil && !fitAtLeast(item, lq.minFit) && keep(item, row, listQuery{marks: lq.marks, read: lq.read,
+			asOf: lq.asOf, search: lq.search}) {
+			resp.Below++
 		}
 		if keep(item, row, lq) {
 			resp.Stories = append(resp.Stories, item)
@@ -524,12 +541,36 @@ func (a *API) readAll(w http.ResponseWriter, r *http.Request) {
 			ids = append(ids, row.ID)
 		}
 	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	n, err := a.Svc.Store.MarkRead(r.Context(), ids, now)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int64{"marked": n})
+	writeJSON(w, http.StatusOK, ReadAllResponse{Marked: n, IDs: ids, ReadAt: now})
+}
+
+// undoReadAll makes the stories of one Mark all read unread again. It finds
+// them by the read time of that call, so stories read at another time stay read.
+func (a *API) undoReadAll(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ReadAt string `json:"read_at"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad JSON body")
+		return
+	}
+	at, err := time.Parse(time.RFC3339Nano, body.ReadAt)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "read_at must be the read_at of a Mark all read answer")
+		return
+	}
+	n, err := a.Svc.Store.UnreadReadAt(r.Context(), at)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"unread": n})
 }
 
 func (a *API) visit(w http.ResponseWriter, r *http.Request) {
