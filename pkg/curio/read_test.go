@@ -336,3 +336,54 @@ func TestAPI_Visit(t *testing.T) {
 	rec, _ = do(t, h, http.MethodGet, "/api/v1/stories?client=BB", "", nil)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
+
+func TestAPI_UndoMarkAllRead(t *testing.T) {
+	svc, h := newTestAPI(t)
+	now := t0.Add(time.Hour)
+	svc.Now = func() time.Time { return now }
+
+	// story 2 is read before Mark all read; the undo must keep it read
+	do(t, h, http.MethodPost, "/api/v1/stories/2/read", `{"read":true}`, nil)
+	now = t0.Add(65 * time.Minute)
+	rec, out := do(t, h, http.MethodPost, "/api/v1/read", `{"before":"2026-11-19T13:05:00Z"}`, nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.InDelta(t, 2, out["marked"], 0)
+	assert.Equal(t, []any{float64(1), float64(3)}, out["ids"], "the ids of the stories that the call read")
+	assert.Equal(t, "2026-11-19T13:05:00Z", out["read_at"])
+
+	// story 3 is marked Good after Mark all read: the undo keeps it read with its mark
+	now = t0.Add(68 * time.Minute)
+	do(t, h, http.MethodPost, "/api/v1/stories/3/mark", `{"mark":"good"}`, nil)
+	now = t0.Add(70 * time.Minute)
+	rec, out = do(t, h, http.MethodPost, "/api/v1/read/undo", `{"read_at":"2026-11-19T13:05:00Z"}`, nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.InDelta(t, 1, out["unread"], 0)
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?read=unread", "", nil)
+	assert.Equal(t, []float64{1}, ids(out), "story 2 stays read; story 3 was marked after Mark all read")
+
+	// nothing to read gives an empty list, not null
+	_, out = do(t, h, http.MethodPost, "/api/v1/read", `{"before":"2026-11-19T12:00:00Z","min_fit":0.99}`, nil)
+	assert.Equal(t, []any{}, out["ids"])
+	for _, body := range []string{`{}`, `{"read_at":"soon"}`} {
+		rec, _ = do(t, h, http.MethodPost, "/api/v1/read/undo", body, nil)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, body)
+	}
+}
+
+func TestAPI_AboveAndBelowTheCutoff(t *testing.T) {
+	_, h := newTestAPI(t)
+
+	// story 1 fits (0.88), story 2 is below 0.5, story 3 is not scored
+	_, out := do(t, h, http.MethodGet, "/api/v1/stories?min_fit=0.5", "", nil)
+	assert.InDelta(t, 1, out["above"], 0, "stories at or above min_fit, read or not")
+	assert.InDelta(t, 1, out["below"], 0, "scored stories that a lower cutoff would add")
+
+	// below follows the read filter; above does not
+	do(t, h, http.MethodPost, "/api/v1/stories/2/read", `{"read":true}`, nil)
+	do(t, h, http.MethodPost, "/api/v1/stories/1/read", `{"read":true}`, nil)
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?min_fit=0.5&read=unread", "", nil)
+	assert.InDelta(t, 1, out["above"], 0)
+	assert.InDelta(t, 0, out["below"], 0)
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?min_fit=0.5&read=all", "", nil)
+	assert.InDelta(t, 1, out["below"], 0)
+}
