@@ -67,7 +67,7 @@ type ListResponse struct {
 	Since     time.Time  `json:"since"`
 	AsOf      time.Time  `json:"as_of"`      // server time of this list; use it for as_of and Mark all read
 	LastVisit *time.Time `json:"last_visit"` // end of the previous visit of the client, null without one
-	Next      *int64     `json:"next"`       // cursor (after) for the next page, null on the last page
+	Next      *string    `json:"next"`       // cursor (after) for the next page, null on the last page
 	Cutoff    float64    `json:"cutoff"`     // default cutoff from the config
 	Status    Status     `json:"status"`
 }
@@ -80,7 +80,7 @@ type listQuery struct {
 	marks  string
 	read   string     // all, unread or read
 	asOf   *time.Time // stories read at or after this time still count as unread
-	after  int64      // cursor: the last story of the previous page
+	after  *ListItem  // cursor: the sort fields and id of the last story of the previous page
 	search string
 	client string
 }
@@ -182,11 +182,9 @@ func (a *API) list(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	all := make(map[int64]ListItem, len(rows))
 	for _, row := range rows {
 		item := a.listItem(row)
 		item.New = resp.LastVisit != nil && item.ReadAt == nil && row.FirstSeen.After(*resp.LastVisit)
-		all[item.ID] = item
 		resp.count(item)
 		if item.New && fitAtLeast(item, lq.minFit) {
 			resp.New++
@@ -198,18 +196,14 @@ func (a *API) list(w http.ResponseWriter, r *http.Request) {
 	less := itemLess(lq.sortBy)
 	sort.Slice(resp.Stories, func(i, j int) bool { return less(resp.Stories[i], resp.Stories[j]) })
 	resp.Listed = len(resp.Stories)
-	if lq.after != 0 {
-		anchor, ok := all[lq.after]
-		if !ok {
-			writeErr(w, http.StatusBadRequest, "the after story is not in the list; load the list again")
-			return
-		}
-		start := sort.Search(len(resp.Stories), func(i int) bool { return less(anchor, resp.Stories[i]) })
+	if lq.after != nil {
+		// the boundary comes from the cursor values, so a story whose points or fit changed since does not move it
+		start := sort.Search(len(resp.Stories), func(i int) bool { return less(*lq.after, resp.Stories[i]) })
 		resp.Stories = resp.Stories[start:]
 	}
 	if len(resp.Stories) > lq.limit {
 		resp.Stories = resp.Stories[:lq.limit]
-		next := resp.Stories[lq.limit-1].ID
+		next := cursorOf(lq.sortBy, resp.Stories[lq.limit-1])
 		resp.Next = &next
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -259,15 +253,67 @@ func parseListQuery(r *http.Request) (lq listQuery, msg string) {
 		lq.asOf = &t
 	}
 	if v := q.Get("after"); v != "" {
-		if lq.after, err = strconv.ParseInt(v, 10, 64); err != nil || lq.after <= 0 {
-			return lq, "after must be a story id"
+		anchor, err := parseCursor(v, lq.sortBy)
+		if err != nil {
+			return lq, "after must be the next cursor of a list with the same sort: " + err.Error()
 		}
+		lq.after = &anchor
 	}
 	if lq.client = q.Get("client"); lq.client != "" && !clientRe.MatchString(lq.client) {
 		return lq, "client must be 1 to 32 lowercase letters, digits or dashes"
 	}
 	lq.search = strings.ToLower(strings.TrimSpace(q.Get("q")))
 	return lq, ""
+}
+
+// cursorOf returns the page cursor after an item: the sort, the sort value
+// (fit, points, or 0 for date), the post time in Unix nanoseconds and the id.
+func cursorOf(by string, item ListItem) string {
+	value := "0"
+	switch by {
+	case "fit":
+		value = strconv.FormatFloat(fitOr(item.Fit), 'g', -1, 64)
+	case "points":
+		value = strconv.Itoa(item.Points)
+	}
+	return fmt.Sprintf("%s:%s:%d:%d", by, value, item.PostedAt.UnixNano(), item.ID)
+}
+
+// parseCursor reads a cursor of cursorOf back into an item with only the sort fields and the id.
+func parseCursor(cursor, by string) (ListItem, error) {
+	parts := strings.Split(cursor, ":")
+	if len(parts) != 4 {
+		return ListItem{}, errors.New("not a cursor")
+	}
+	if parts[0] != by {
+		return ListItem{}, fmt.Errorf("the cursor is for sort %q", parts[0])
+	}
+	posted, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil {
+		return ListItem{}, errors.New("bad post time")
+	}
+	id, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil || id <= 0 {
+		return ListItem{}, errors.New("bad story id")
+	}
+	item := ListItem{ID: id, PostedAt: time.Unix(0, posted).UTC()}
+	switch by {
+	case "fit":
+		fit, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil || (fit != -1 && !(fit >= 0 && fit <= 1)) { // NaN fails both checks
+			return ListItem{}, errors.New("bad fit")
+		}
+		item.Fit = &fit
+	case "points":
+		if item.Points, err = strconv.Atoi(parts[1]); err != nil {
+			return ListItem{}, errors.New("bad points")
+		}
+	default:
+		if parts[1] != "0" {
+			return ListItem{}, errors.New("bad value")
+		}
+	}
+	return item, nil
 }
 
 func fitAtLeast(item ListItem, minFit float64) bool {

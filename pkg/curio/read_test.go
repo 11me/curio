@@ -3,6 +3,7 @@ package curio
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"testing"
 	"time"
@@ -193,28 +194,78 @@ func TestAPI_ReadState(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+// nextCursor returns the next field of a list answer as a query value.
+func nextCursor(t *testing.T, out map[string]any) string {
+	t.Helper()
+	next, ok := out["next"].(string)
+	require.True(t, ok, "next is a string cursor, got %v", out["next"])
+	return url.QueryEscape(next)
+}
+
 func TestAPI_Paging(t *testing.T) {
 	_, h := newTestAPI(t)
 
 	_, out := do(t, h, http.MethodGet, "/api/v1/stories?limit=2", "", nil)
 	assert.Equal(t, []float64{1, 2}, ids(out))
 	assert.InDelta(t, 3, out["listed"], 0, "listed counts every match, not only this page")
-	assert.InDelta(t, 2, out["next"], 0, "next is the cursor for the next page")
 
-	_, out = do(t, h, http.MethodGet, "/api/v1/stories?limit=2&after=2", "", nil)
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?limit=2&after="+nextCursor(t, out), "", nil)
 	assert.Equal(t, []float64{3}, ids(out))
 	assert.Nil(t, out["next"], "the last page has no cursor")
 
-	// the cursor is a story, not a position: a story that leaves the filter does not shift the next page
-	_, out = do(t, h, http.MethodGet, "/api/v1/stories?limit=1&after=1&min_fit=0.5", "", nil)
-	assert.Empty(t, ids(out))
-	_, out = do(t, h, http.MethodGet, "/api/v1/stories?limit=1&after=2&sort=date", "", nil)
-	assert.Equal(t, []float64{3}, ids(out), "date order is 1, 2, 3")
+	// the cursor holds the sort values, not a position: a story that leaves the filter does not shift the next page
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?limit=1&min_fit=0.5", "", nil)
+	assert.Equal(t, []float64{1}, ids(out))
+	assert.Nil(t, out["next"])
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?limit=2&sort=date", "", nil)
+	assert.Equal(t, []float64{1, 2}, ids(out), "date order is 1, 2, 3")
+	dateNext := nextCursor(t, out)
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?limit=2&sort=date&after="+dateNext, "", nil)
+	assert.Equal(t, []float64{3}, ids(out))
 
-	rec, _ := do(t, h, http.MethodGet, "/api/v1/stories?after=999", "", nil)
-	assert.Equal(t, http.StatusBadRequest, rec.Code, "an unknown cursor story")
-	rec, _ = do(t, h, http.MethodGet, "/api/v1/stories?after=x", "", nil)
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	for _, bad := range []string{"x", "999", "date:0:1", "fit:x:0:1", "fit:0.5:0:0", "fit:0.5:x:1", "fit:NaN:0:1"} {
+		rec, _ := do(t, h, http.MethodGet, "/api/v1/stories?after="+url.QueryEscape(bad), "", nil)
+		assert.Equal(t, http.StatusBadRequest, rec.Code, bad)
+	}
+	rec, _ := do(t, h, http.MethodGet, "/api/v1/stories?sort=points&after="+dateNext, "", nil)
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "a cursor of another sort")
+}
+
+// TestAPI_PagingKeepsTheBoundary changes the points of the last story of a
+// page before the next page: the next page still starts after the old boundary.
+func TestAPI_PagingKeepsTheBoundary(t *testing.T) {
+	svc, h := newTestAPI(t)
+	ctx := context.Background()
+
+	// points are 10, 20 and 30, so the order is 3, 2, 1
+	_, out := do(t, h, http.MethodGet, "/api/v1/stories?sort=points&limit=1", "", nil)
+	require.Equal(t, []float64{3}, ids(out))
+	after := nextCursor(t, out)
+
+	// a refresh drops story 3 to 5 points, below every other story
+	next := front(1, 2, 3)
+	next[2].Points = 5
+	_, err := svc.Store.UpsertFront(ctx, next, t0.Add(30*time.Minute))
+	require.NoError(t, err)
+
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?sort=points&limit=1&after="+after, "", nil)
+	assert.Equal(t, []float64{2}, ids(out), "story 2 is not skipped")
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?sort=points&limit=5&after="+nextCursor(t, out), "", nil)
+	assert.Equal(t, []float64{1, 3}, ids(out), "story 3 comes again at its new place")
+
+	// the same for a new fit: story 4 has fit 0.5, so the order is 1, 4, 2, 3
+	_, err = svc.Store.UpsertFront(ctx, front(1, 2, 3, 4), t0.Add(time.Hour))
+	require.NoError(t, err)
+	require.NoError(t, svc.Store.SaveScore(ctx, 4, "A release.", []Answer{{"release", 1, "a release"}}, t0))
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?limit=1", "", nil)
+	require.Equal(t, []float64{1}, ids(out))
+	after = nextCursor(t, out)
+	// story 1 is scored again with no answers: fit 0.27, below story 4
+	require.NoError(t, svc.Store.SaveScore(ctx, 1, "Rust ships.", []Answer{}, t0))
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?limit=1", "", nil)
+	require.Equal(t, []float64{4}, ids(out), "story 4 is first now")
+	_, out = do(t, h, http.MethodGet, "/api/v1/stories?limit=1&after="+after, "", nil)
+	assert.Equal(t, []float64{4}, ids(out), "story 4 is not skipped")
 }
 
 func TestAPI_Visit(t *testing.T) {

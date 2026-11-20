@@ -124,8 +124,12 @@ into later prompts as `past_picks` and `past_rejects`.
   unread and first seen after it, and the `new` count of the stories at or
   above `min_fit`. The first visit has no new stories.
 - The list comes in pages. `next` is the cursor: send it as `after` for the
-  next page; it is null on the last page. The cursor is a story, not a
-  position, so stories that leave the list do not shift the next page.
+  next page, with the same `sort`; it is null on the last page. The cursor
+  holds the sort values of the last story (fit or points, the post time and
+  the id), not a position. A refresh that changes the points or fit of that
+  story does not move the start of the next page, and stories that leave the
+  list do not shift it. A story whose place moved across the boundary can
+  come twice or come only on the next poll.
 - Send the `as_of` of the first page with each later page and each poll. Then
   `read=unread` keeps the stories that you read after that time, so they do
   not drop out while you read.
