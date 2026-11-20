@@ -129,6 +129,8 @@ into later prompts as `past_picks` and `past_rejects`.
 - Send the `as_of` of the first page with each later page and each poll. Then
   `read=unread` keeps the stories that you read after that time, so they do
   not drop out while you read.
+- A database from an older build gets the new column on start. Stories that
+  were marked Good or Bad before count as read from their mark time.
 - The cleanup (`keep_days`) never deletes a story that is read, marked or has a
   task.
 

@@ -85,15 +85,49 @@ func OpenStore(ctx context.Context, path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
-	// databases from older builds miss the newer columns; adding a column keeps every row
-	for _, col := range []string{"score_failed_at DATETIME", "read_at DATETIME"} {
-		if _, err := db.ExecContext(ctx, `ALTER TABLE stories ADD COLUMN `+col); err != nil &&
-			!strings.Contains(err.Error(), "duplicate column") {
-			_ = db.Close()
-			return nil, fmt.Errorf("add column %s: %w", col, err)
-		}
+	if err := migrate(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return &Store{db: db}, nil
+}
+
+// migrate adds the newer columns to a database from an older build; adding a
+// column keeps every row. When read_at is new, a story with a Good or Bad mark
+// counts as read from its mark time, as a mark reads a story.
+func migrate(ctx context.Context, db *sqlx.DB) error {
+	for _, col := range []string{"score_failed_at", "read_at"} {
+		if err := addColumn(ctx, db, col); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// addColumn adds one DATETIME column and, for read_at, reads the marked
+// stories in the same transaction. A column that exists already is left as is.
+func addColumn(ctx context.Context, db *sqlx.DB, col string) error {
+	tx, err := db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE stories ADD COLUMN `+col+` DATETIME`); err != nil {
+		if strings.Contains(err.Error(), "duplicate column") {
+			return nil
+		}
+		return fmt.Errorf("add column %s: %w", col, err)
+	}
+	if col == "read_at" {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE stories SET read_at = marked_at WHERE mark != '' AND marked_at IS NOT NULL`); err != nil {
+			return fmt.Errorf("read marked stories: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit column %s: %w", col, err)
+	}
+	return nil
 }
 
 // visitGap is the pause after which the next visit of a client is a new visit.

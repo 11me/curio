@@ -110,19 +110,30 @@ func TestOpenStore_AddsReadState(t *testing.T) {
 			score_attempts INTEGER NOT NULL DEFAULT 0, mark TEXT NOT NULL DEFAULT '', marked_at DATETIME,
 			task_key TEXT NOT NULL DEFAULT '');
 		INSERT INTO stories (id, title, url, posted_at, first_seen, last_seen, mark, marked_at)
-		VALUES (7, 'Old story', 'https://example.com/7', ?, ?, ?, 'good', ?);`, t0, t0, t0, t0)
+		VALUES (7, 'Old story', 'https://example.com/7', ?, ?, ?, 'good', ?);
+		INSERT INTO stories (id, title, url, posted_at, first_seen, last_seen)
+		VALUES (8, 'Unmarked story', 'https://example.com/8', ?, ?, ?);`, t0, t0, t0, t0, t0, t0, t0)
 	require.NoError(t, err)
 	require.NoError(t, old.Close())
 
-	for range 2 { // the second open finds the columns in place
+	for i := range 2 { // the second open finds the columns in place and changes nothing
 		st, err := OpenStore(ctx, path)
 		require.NoError(t, err)
 		row, err := st.Get(ctx, 7)
 		require.NoError(t, err)
 		assert.Equal(t, "Old story", row.Title)
 		assert.Equal(t, MarkGood, row.Mark)
-		assert.False(t, row.ReadAt.Valid, "old stories start unread")
+		require.True(t, row.ReadAt.Valid, "a story marked before read state counts as read")
+		assert.True(t, row.ReadAt.Time.Equal(t0), "its read time is the mark time")
 		assert.False(t, row.ScoreFailedAt.Valid)
+		unmarked, err := st.Get(ctx, 8)
+		require.NoError(t, err)
+		if i == 0 {
+			assert.False(t, unmarked.ReadAt.Valid, "an unmarked old story starts unread")
+			require.NoError(t, st.SetRead(ctx, 8, true, t0.Add(time.Hour)))
+		} else {
+			assert.True(t, unmarked.ReadAt.Valid, "a read time stays after the next open")
+		}
 		_, err = st.Visit(ctx, "bb", t0)
 		require.NoError(t, err)
 		require.NoError(t, st.Close())
