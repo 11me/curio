@@ -314,13 +314,18 @@ func (s *Store) SetRead(ctx context.Context, id int64, read bool, now time.Time)
 	return s.update(ctx, id, `UPDATE stories SET read_at = COALESCE(read_at, ?) WHERE id = ?`, now, id)
 }
 
-// MarkAllRead reads every unread story first seen at or before the given time
-// and returns how many stories it changed.
-func (s *Store) MarkAllRead(ctx context.Context, before, now time.Time) (int64, error) {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE stories SET read_at = ? WHERE read_at IS NULL AND first_seen <= ?`, now, before.UTC())
+// MarkRead reads the given stories that are unread and returns how many it changed.
+func (s *Store) MarkRead(ctx context.Context, ids []int64, now time.Time) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	query, args, err := sqlx.In(`UPDATE stories SET read_at = ? WHERE read_at IS NULL AND id IN (?)`, now, ids)
 	if err != nil {
-		return 0, fmt.Errorf("mark all read: %w", err)
+		return 0, fmt.Errorf("mark read query: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("mark read: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return n, nil

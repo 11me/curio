@@ -108,7 +108,7 @@ into later prompts as `past_picks` and `past_rejects`.
 | POST | `/api/v1/stories/{id}/mark` | `{"mark":"good"}`, `"bad"` or `"none"` |
 | POST | `/api/v1/stories/{id}/task` | `{"key":"PER-12"}` records a task made from the story |
 | POST | `/api/v1/stories/{id}/read` | `{"read":true}` or `false`: marks one story read or unread |
-| POST | `/api/v1/read` | `{"before":"<as_of>"}` reads every story first seen up to that time |
+| POST | `/api/v1/read` | `{"before":"<as_of>","min_fit":0.5}` reads the unread stories that the list can show (see below) |
 | POST | `/api/v1/visit` | `{"client":"bb"}` records a visit; the answer has the end of the previous visit |
 | POST | `/api/v1/refresh` | `{}` starts a refresh; 429 within `min_refresh` |
 | GET | `/api/v1/status` | Refresh state |
@@ -116,8 +116,12 @@ into later prompts as `past_picks` and `past_rejects`.
 ### Read state and pages
 
 - A story is read when you open it, mark it Good or Bad, or mark it read. It
-  keeps its first read time. Mark all read takes a time (the `as_of` of the
-  list), so a story that came later stays unread.
+  keeps its first read time. Mark all read reads only the stories that the
+  list can show: first seen up to a time (the `as_of` of the newest list
+  answer), in the `days` of the list, and at or above `min_fit`. A story that
+  came later, a story below the cutoff and an older story stay unread, and
+  the cleanup removes them.
+- The `unread` and `new` counts of the list follow `min_fit`, as the list does.
 - A visit is one `POST /api/v1/visit` of a client, such as `bb`. Calls less
   than 30 minutes apart are one visit. With `client`, the list gives
   `last_visit` (the end of the previous visit), `new` on each story that is

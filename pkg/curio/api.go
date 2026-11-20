@@ -62,8 +62,8 @@ type ListResponse struct {
 	Good      int        `json:"good"`
 	Bad       int        `json:"bad"`
 	Unscored  int        `json:"unscored"`
-	Unread    int        `json:"unread"`
-	New       int        `json:"new"` // new stories at or above min_fit
+	Unread    int        `json:"unread"` // unread stories at or above min_fit
+	New       int        `json:"new"`    // new stories at or above min_fit
 	Since     time.Time  `json:"since"`
 	AsOf      time.Time  `json:"as_of"`      // server time of this list; use it for as_of and Mark all read
 	LastVisit *time.Time `json:"last_visit"` // end of the previous visit of the client, null without one
@@ -186,6 +186,10 @@ func (a *API) list(w http.ResponseWriter, r *http.Request) {
 		item := a.listItem(row)
 		item.New = resp.LastVisit != nil && item.ReadAt == nil && row.FirstSeen.After(*resp.LastVisit)
 		resp.count(item)
+		// the unread and new counts follow the cutoff, as the list does
+		if item.ReadAt == nil && fitAtLeast(item, lq.minFit) {
+			resp.Unread++
+		}
 		if item.New && fitAtLeast(item, lq.minFit) {
 			resp.New++
 		}
@@ -218,9 +222,6 @@ func (resp *ListResponse) count(item ListItem) {
 	}
 	if item.Fit == nil {
 		resp.Unscored++
-	}
-	if item.ReadAt == nil {
-		resp.Unread++
 	}
 }
 
@@ -489,9 +490,13 @@ func (a *API) read(w http.ResponseWriter, r *http.Request) {
 	a.writeDetail(w, r, id)
 }
 
+// readAll reads the stories that the list can show: unread, first seen up to
+// before and in the days of the list, at or above min_fit. Other stories stay
+// unread, so the cleanup can remove them.
 func (a *API) readAll(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Before string `json:"before"`
+		Before string  `json:"before"`
+		MinFit float64 `json:"min_fit"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad JSON body")
@@ -502,7 +507,24 @@ func (a *API) readAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "before must be an RFC 3339 time, for example the as_of of the list")
 		return
 	}
-	n, err := a.Svc.Store.MarkAllRead(r.Context(), before, a.Svc.now())
+	if body.MinFit < 0 || body.MinFit > 1 {
+		writeErr(w, http.StatusBadRequest, "min_fit must be 0 to 1")
+		return
+	}
+	now := a.Svc.now()
+	rows, err := a.Svc.Store.Since(r.Context(), now.AddDate(0, 0, -a.Svc.Cfg.Days))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ids := []int64{}
+	for _, row := range rows {
+		item := a.listItem(row)
+		if item.ReadAt == nil && !row.FirstSeen.After(before) && fitAtLeast(item, body.MinFit) {
+			ids = append(ids, row.ID)
+		}
+	}
+	n, err := a.Svc.Store.MarkRead(r.Context(), ids, now)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
