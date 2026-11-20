@@ -4,7 +4,7 @@ data_dir: ~/.curio       # database, run lock and API socket (sock/curio.sock); 
 interval: 30m            # front page refresh
 front_n: 30              # stories read from the front page
 days: 7                  # the list shows stories first seen in this many days
-keep_days: 14            # unmarked stories older than this are deleted
+keep_days: 14            # unread, unmarked stories older than this are deleted
 cutoff: 0.5              # default fit cutoff for clients
 extract: true            # fetch article text for better summaries
 

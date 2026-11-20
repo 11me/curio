@@ -25,19 +25,21 @@ type API struct {
 
 // ListItem is one row of the list.
 type ListItem struct {
-	ID            int64     `json:"id"`
-	Title         string    `json:"title"`
-	URL           string    `json:"url"`
-	DiscussionURL string    `json:"discussion_url"`
-	Domain        string    `json:"domain"`
-	Points        int       `json:"points"`
-	Comments      int       `json:"comments"`
-	PostedAt      time.Time `json:"posted_at"`
-	FirstSeen     time.Time `json:"first_seen"`
-	Rank          int       `json:"rank"` // front page position now, 0 when it left
-	Fit           *float64  `json:"fit"`  // null until scored
-	Mark          string    `json:"mark"`
-	TaskKey       string    `json:"task_key"`
+	ID            int64      `json:"id"`
+	Title         string     `json:"title"`
+	URL           string     `json:"url"`
+	DiscussionURL string     `json:"discussion_url"`
+	Domain        string     `json:"domain"`
+	Points        int        `json:"points"`
+	Comments      int        `json:"comments"`
+	PostedAt      time.Time  `json:"posted_at"`
+	FirstSeen     time.Time  `json:"first_seen"`
+	Rank          int        `json:"rank"` // front page position now, 0 when it left
+	Fit           *float64   `json:"fit"`  // null until scored
+	Mark          string     `json:"mark"`
+	TaskKey       string     `json:"task_key"`
+	ReadAt        *time.Time `json:"read_at"` // null while unread
+	New           bool       `json:"new"`     // unread and first seen after the last visit of the client
 }
 
 // Detail is one story with its summary and reasons.
@@ -54,18 +56,46 @@ type Detail struct {
 
 // ListResponse is the list with counts.
 type ListResponse struct {
-	Stories  []ListItem `json:"stories"`
-	Listed   int        `json:"listed"`
-	Total    int        `json:"total"`
-	Good     int        `json:"good"`
-	Bad      int        `json:"bad"`
-	Unscored int        `json:"unscored"`
-	Since    time.Time  `json:"since"`
-	Cutoff   float64    `json:"cutoff"` // default cutoff from the config
-	Status   Status     `json:"status"`
+	Stories   []ListItem `json:"stories"`
+	Listed    int        `json:"listed"`
+	Total     int        `json:"total"`
+	Good      int        `json:"good"`
+	Bad       int        `json:"bad"`
+	Unscored  int        `json:"unscored"`
+	Unread    int        `json:"unread"`
+	New       int        `json:"new"` // new stories at or above min_fit
+	Since     time.Time  `json:"since"`
+	AsOf      time.Time  `json:"as_of"`      // server time of this list; use it for as_of and Mark all read
+	LastVisit *time.Time `json:"last_visit"` // end of the previous visit of the client, null without one
+	Next      *int64     `json:"next"`       // cursor (after) for the next page, null on the last page
+	Cutoff    float64    `json:"cutoff"`     // default cutoff from the config
+	Status    Status     `json:"status"`
 }
 
-var taskKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9]{0,9}-\d{1,7}$`)
+// listQuery is the parsed query of the list call.
+type listQuery struct {
+	minFit float64
+	limit  int
+	sortBy string
+	marks  string
+	read   string     // all, unread or read
+	asOf   *time.Time // stories read at or after this time still count as unread
+	after  int64      // cursor: the last story of the previous page
+	search string
+	client string
+}
+
+// VisitResponse is the answer to a visit.
+type VisitResponse struct {
+	Client    string     `json:"client"`
+	VisitAt   time.Time  `json:"visit_at"`
+	LastVisit *time.Time `json:"last_visit"` // end of the previous visit, null on the first one
+}
+
+var (
+	taskKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9]{0,9}-\d{1,7}$`)
+	clientRe  = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
+)
 
 // Handler returns the API handler with the loopback guard.
 func (a *API) Handler() http.Handler {
@@ -75,6 +105,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/stories/{id}", a.detail)
 	mux.HandleFunc("POST /api/v1/stories/{id}/mark", a.mark)
 	mux.HandleFunc("POST /api/v1/stories/{id}/task", a.task)
+	mux.HandleFunc("POST /api/v1/stories/{id}/read", a.read)
+	mux.HandleFunc("POST /api/v1/read", a.readAll)
+	mux.HandleFunc("POST /api/v1/visit", a.visit)
 	mux.HandleFunc("POST /api/v1/refresh", a.refresh)
 	return guard(a.Token, mux)
 }
@@ -128,79 +161,146 @@ func (a *API) status(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *API) list(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	minFit, err := floatParam(q.Get("min_fit"), 0)
-	if err != nil || minFit < 0 || minFit > 1 {
-		writeErr(w, http.StatusBadRequest, "min_fit must be 0 to 1")
+	lq, msg := parseListQuery(r)
+	if msg != "" {
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
-	limit, err := strconv.Atoi(defaultStr(q.Get("limit"), "200"))
-	if err != nil || limit < 1 || limit > 500 {
-		writeErr(w, http.StatusBadRequest, "limit must be 1 to 500")
-		return
-	}
-	sortBy := defaultStr(q.Get("sort"), "fit")
-	if sortBy != "fit" && sortBy != "date" && sortBy != "points" {
-		writeErr(w, http.StatusBadRequest, "sort must be fit, date or points")
-		return
-	}
-	marks := defaultStr(q.Get("marks"), "all")
-	if marks != "all" && marks != "hide" && marks != "good" && marks != "bad" {
-		writeErr(w, http.StatusBadRequest, "marks must be all, hide, good or bad")
-		return
-	}
-	search := strings.ToLower(strings.TrimSpace(q.Get("q")))
-
 	cfg := a.Svc.Cfg
-	since := a.Svc.now().AddDate(0, 0, -cfg.Days)
+	now := a.Svc.now()
+	since := now.AddDate(0, 0, -cfg.Days)
 	rows, err := a.Svc.Store.Since(r.Context(), since)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	resp := ListResponse{Stories: []ListItem{}, Since: since, AsOf: now, Cutoff: cfg.Cutoff, Status: a.Svc.Status(), Total: len(rows)}
+	if lq.client != "" {
+		if resp.LastVisit, err = a.Svc.Store.LastVisit(r.Context(), lq.client); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 
-	resp := ListResponse{Stories: []ListItem{}, Since: since, Cutoff: cfg.Cutoff, Status: a.Svc.Status(), Total: len(rows)}
+	all := make(map[int64]ListItem, len(rows))
 	for _, row := range rows {
 		item := a.listItem(row)
-		switch row.Mark {
-		case MarkGood:
-			resp.Good++
-		case MarkBad:
-			resp.Bad++
+		item.New = resp.LastVisit != nil && item.ReadAt == nil && row.FirstSeen.After(*resp.LastVisit)
+		all[item.ID] = item
+		resp.count(item)
+		if item.New && fitAtLeast(item, lq.minFit) {
+			resp.New++
 		}
-		if item.Fit == nil {
-			resp.Unscored++
+		if keep(item, row, lq) {
+			resp.Stories = append(resp.Stories, item)
 		}
-		if !keep(item, row, minFit, marks, search) {
-			continue
-		}
-		resp.Stories = append(resp.Stories, item)
 	}
-	sortItems(resp.Stories, sortBy)
+	less := itemLess(lq.sortBy)
+	sort.Slice(resp.Stories, func(i, j int) bool { return less(resp.Stories[i], resp.Stories[j]) })
 	resp.Listed = len(resp.Stories)
-	if len(resp.Stories) > limit {
-		resp.Stories = resp.Stories[:limit]
+	if lq.after != 0 {
+		anchor, ok := all[lq.after]
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "the after story is not in the list; load the list again")
+			return
+		}
+		start := sort.Search(len(resp.Stories), func(i int) bool { return less(anchor, resp.Stories[i]) })
+		resp.Stories = resp.Stories[start:]
+	}
+	if len(resp.Stories) > lq.limit {
+		resp.Stories = resp.Stories[:lq.limit]
+		next := resp.Stories[lq.limit-1].ID
+		resp.Next = &next
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func keep(item ListItem, row StoryRow, minFit float64, marks, search string) bool {
-	if minFit > 0 && (item.Fit == nil || *item.Fit < minFit) {
+func (resp *ListResponse) count(item ListItem) {
+	switch item.Mark {
+	case MarkGood:
+		resp.Good++
+	case MarkBad:
+		resp.Bad++
+	}
+	if item.Fit == nil {
+		resp.Unscored++
+	}
+	if item.ReadAt == nil {
+		resp.Unread++
+	}
+}
+
+// parseListQuery reads the list query; a non-empty message means a bad query.
+func parseListQuery(r *http.Request) (lq listQuery, msg string) {
+	q := r.URL.Query()
+	var err error
+	if lq.minFit, err = floatParam(q.Get("min_fit"), 0); err != nil || lq.minFit < 0 || lq.minFit > 1 {
+		return lq, "min_fit must be 0 to 1"
+	}
+	if lq.limit, err = strconv.Atoi(defaultStr(q.Get("limit"), "200")); err != nil || lq.limit < 1 || lq.limit > 500 {
+		return lq, "limit must be 1 to 500"
+	}
+	if lq.sortBy = defaultStr(q.Get("sort"), "fit"); lq.sortBy != "fit" && lq.sortBy != "date" && lq.sortBy != "points" {
+		return lq, "sort must be fit, date or points"
+	}
+	lq.marks = defaultStr(q.Get("marks"), "all")
+	if lq.marks != "all" && lq.marks != "hide" && lq.marks != "good" && lq.marks != "bad" {
+		return lq, "marks must be all, hide, good or bad"
+	}
+	if lq.read = defaultStr(q.Get("read"), "all"); lq.read != "all" && lq.read != "unread" && lq.read != "read" {
+		return lq, "read must be all, unread or read"
+	}
+	if v := q.Get("as_of"); v != "" {
+		t, err := time.Parse(time.RFC3339Nano, v)
+		if err != nil {
+			return lq, "as_of must be an RFC 3339 time"
+		}
+		t = t.UTC()
+		lq.asOf = &t
+	}
+	if v := q.Get("after"); v != "" {
+		if lq.after, err = strconv.ParseInt(v, 10, 64); err != nil || lq.after <= 0 {
+			return lq, "after must be a story id"
+		}
+	}
+	if lq.client = q.Get("client"); lq.client != "" && !clientRe.MatchString(lq.client) {
+		return lq, "client must be 1 to 32 lowercase letters, digits or dashes"
+	}
+	lq.search = strings.ToLower(strings.TrimSpace(q.Get("q")))
+	return lq, ""
+}
+
+func fitAtLeast(item ListItem, minFit float64) bool {
+	return minFit <= 0 || (item.Fit != nil && *item.Fit >= minFit)
+}
+
+func keep(item ListItem, row StoryRow, lq listQuery) bool {
+	if !fitAtLeast(item, lq.minFit) {
 		return false
 	}
-	switch marks {
+	switch lq.marks {
 	case "hide":
 		if row.Mark != MarkNone {
 			return false
 		}
 	case "good", "bad":
-		if row.Mark != marks {
+		if row.Mark != lq.marks {
 			return false
 		}
 	}
-	if search != "" {
+	switch lq.read {
+	case "unread":
+		if item.ReadAt != nil && (lq.asOf == nil || item.ReadAt.Before(*lq.asOf)) {
+			return false
+		}
+	case "read":
+		if item.ReadAt == nil {
+			return false
+		}
+	}
+	if lq.search != "" {
 		hay := strings.ToLower(row.Title + " " + row.Domain + " " + row.Summary)
-		for _, word := range strings.Fields(search) {
+		for _, word := range strings.Fields(lq.search) {
 			if !strings.Contains(hay, word) {
 				return false
 			}
@@ -209,21 +309,28 @@ func keep(item ListItem, row StoryRow, minFit float64, marks, search string) boo
 	return true
 }
 
-func sortItems(items []ListItem, by string) {
-	sort.SliceStable(items, func(i, j int) bool {
-		a, b := items[i], items[j]
+// itemLess returns a total order for the list, so a story id works as a page cursor.
+func itemLess(by string) func(a, b ListItem) bool {
+	return func(a, b ListItem) bool {
 		switch by {
 		case "date":
-			return a.PostedAt.After(b.PostedAt)
+			if !a.PostedAt.Equal(b.PostedAt) {
+				return a.PostedAt.After(b.PostedAt)
+			}
 		case "points":
-			return a.Points > b.Points
+			if a.Points != b.Points {
+				return a.Points > b.Points
+			}
+		default:
+			if fa, fb := fitOr(a.Fit), fitOr(b.Fit); fa != fb {
+				return fa > fb
+			}
+			if !a.PostedAt.Equal(b.PostedAt) {
+				return a.PostedAt.After(b.PostedAt)
+			}
 		}
-		fa, fb := fitOr(a.Fit), fitOr(b.Fit)
-		if fa != fb {
-			return fa > fb
-		}
-		return a.PostedAt.After(b.PostedAt)
-	})
+		return a.ID > b.ID
+	}
 }
 
 func fitOr(f *float64) float64 {
@@ -237,7 +344,7 @@ func (a *API) listItem(row StoryRow) ListItem {
 	item := ListItem{
 		ID: row.ID, Title: row.Title, URL: row.URL, DiscussionURL: hn.DiscussionURL(row.ID), Domain: row.Domain,
 		Points: row.Points, Comments: row.Comments, PostedAt: row.PostedAt, FirstSeen: row.FirstSeen,
-		Rank: row.Rank, Mark: row.Mark, TaskKey: row.TaskKey,
+		Rank: row.Rank, Mark: row.Mark, TaskKey: row.TaskKey, ReadAt: nullTime(row.ReadAt),
 	}
 	if row.ScoredAt.Valid {
 		fit, _ := Fit(a.Svc.Cfg.Bias, a.Svc.Cfg.Criteria, row.Answers())
@@ -315,6 +422,63 @@ func (a *API) task(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.writeDetail(w, r, id)
+}
+
+func (a *API) read(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Read *bool `json:"read"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Read == nil {
+		writeErr(w, http.StatusBadRequest, "body must be {\"read\": true} or {\"read\": false}")
+		return
+	}
+	if err := a.Svc.Store.SetRead(r.Context(), id, *body.Read, a.Svc.now()); err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	a.writeDetail(w, r, id)
+}
+
+func (a *API) readAll(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Before string `json:"before"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad JSON body")
+		return
+	}
+	before, err := time.Parse(time.RFC3339Nano, body.Before)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "before must be an RFC 3339 time, for example the as_of of the list")
+		return
+	}
+	n, err := a.Svc.Store.MarkAllRead(r.Context(), before, a.Svc.now())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"marked": n})
+}
+
+func (a *API) visit(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Client string `json:"client"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !clientRe.MatchString(body.Client) {
+		writeErr(w, http.StatusBadRequest, "client must be 1 to 32 lowercase letters, digits or dashes")
+		return
+	}
+	now := a.Svc.now()
+	last, err := a.Svc.Store.Visit(r.Context(), body.Client, now)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, VisitResponse{Client: body.Client, VisitAt: now, LastVisit: last})
 }
 
 func (a *API) refresh(w http.ResponseWriter, _ *http.Request) {

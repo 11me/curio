@@ -56,7 +56,13 @@ CREATE TABLE IF NOT EXISTS stories (
 	mark TEXT NOT NULL DEFAULT '',
 	marked_at DATETIME,
 	task_key TEXT NOT NULL DEFAULT '',
-	score_failed_at DATETIME
+	score_failed_at DATETIME,
+	read_at DATETIME
+);
+CREATE TABLE IF NOT EXISTS visits (
+	client TEXT PRIMARY KEY,
+	visit_at DATETIME NOT NULL,
+	last_visit DATETIME
 );
 CREATE TABLE IF NOT EXISTS usage (
 	day TEXT PRIMARY KEY,
@@ -79,14 +85,19 @@ func OpenStore(ctx context.Context, path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
-	// databases from the first build have no score_failed_at column
-	if _, err := db.ExecContext(ctx, `ALTER TABLE stories ADD COLUMN score_failed_at DATETIME`); err != nil &&
-		!strings.Contains(err.Error(), "duplicate column") {
-		_ = db.Close()
-		return nil, fmt.Errorf("add column: %w", err)
+	// databases from older builds miss the newer columns; adding a column keeps every row
+	for _, col := range []string{"score_failed_at DATETIME", "read_at DATETIME"} {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE stories ADD COLUMN `+col); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			_ = db.Close()
+			return nil, fmt.Errorf("add column %s: %w", col, err)
+		}
 	}
 	return &Store{db: db}, nil
 }
+
+// visitGap is the pause after which the next visit of a client is a new visit.
+const visitGap = 30 * time.Minute
 
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
@@ -117,6 +128,7 @@ type StoryRow struct {
 	MarkedAt      sql.NullTime `db:"marked_at"`
 	TaskKey       string       `db:"task_key"`
 	ScoreFailedAt sql.NullTime `db:"score_failed_at"`
+	ReadAt        sql.NullTime `db:"read_at"`
 }
 
 // Answers decodes the stored answers.
@@ -248,16 +260,90 @@ func (s *Store) Get(ctx context.Context, id int64) (StoryRow, error) {
 	return row, nil
 }
 
-// SetMark sets Good, Bad or no mark.
+// SetMark sets Good, Bad or no mark. A Good or Bad mark also reads the story.
 func (s *Store) SetMark(ctx context.Context, id int64, mark string, now time.Time) error {
 	if mark != MarkNone && mark != MarkGood && mark != MarkBad {
 		return fmt.Errorf("unknown mark %q", mark)
 	}
-	var at any = now
 	if mark == MarkNone {
-		at = nil
+		return s.update(ctx, id, `UPDATE stories SET mark = '', marked_at = NULL WHERE id = ?`, id)
 	}
-	return s.update(ctx, id, `UPDATE stories SET mark = ?, marked_at = ? WHERE id = ?`, mark, at, id)
+	return s.update(ctx, id, `UPDATE stories SET mark = ?, marked_at = ?, read_at = COALESCE(read_at, ?) WHERE id = ?`,
+		mark, now, now, id)
+}
+
+// SetRead marks a story read or unread. A story that is read already keeps its first read time.
+func (s *Store) SetRead(ctx context.Context, id int64, read bool, now time.Time) error {
+	if !read {
+		return s.update(ctx, id, `UPDATE stories SET read_at = NULL WHERE id = ?`, id)
+	}
+	return s.update(ctx, id, `UPDATE stories SET read_at = COALESCE(read_at, ?) WHERE id = ?`, now, id)
+}
+
+// MarkAllRead reads every unread story first seen at or before the given time
+// and returns how many stories it changed.
+func (s *Store) MarkAllRead(ctx context.Context, before, now time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE stories SET read_at = ? WHERE read_at IS NULL AND first_seen <= ?`, now, before.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("mark all read: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// Visit records a visit of a client and returns the end of its previous
+// visit (nil for the first one). Calls less than visitGap apart are one visit.
+func (s *Store) Visit(ctx context.Context, client string, now time.Time) (*time.Time, error) {
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var row struct {
+		VisitAt   time.Time    `db:"visit_at"`
+		LastVisit sql.NullTime `db:"last_visit"`
+	}
+	err = tx.GetContext(ctx, &row, `SELECT visit_at, last_visit FROM visits WHERE client = ?`, client)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		row.LastVisit = sql.NullTime{}
+	case err != nil:
+		return nil, fmt.Errorf("read visit: %w", err)
+	case now.Sub(row.VisitAt) >= visitGap:
+		row.LastVisit = sql.NullTime{Time: row.VisitAt, Valid: true}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO visits (client, visit_at, last_visit) VALUES (?, ?, ?)
+		ON CONFLICT(client) DO UPDATE SET visit_at = excluded.visit_at, last_visit = excluded.last_visit`,
+		client, now, row.LastVisit); err != nil {
+		return nil, fmt.Errorf("save visit: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit visit: %w", err)
+	}
+	return nullTime(row.LastVisit), nil
+}
+
+// LastVisit returns the end of the previous visit of a client, or nil.
+func (s *Store) LastVisit(ctx context.Context, client string) (*time.Time, error) {
+	var last sql.NullTime
+	err := s.db.GetContext(ctx, &last, `SELECT last_visit FROM visits WHERE client = ?`, client)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read last visit: %w", err)
+	}
+	return nullTime(last), nil
+}
+
+func nullTime(t sql.NullTime) *time.Time {
+	if !t.Valid {
+		return nil
+	}
+	v := t.Time
+	return &v
 }
 
 // SetTask records the task made from a story.
@@ -287,10 +373,10 @@ func (s *Store) RecentMarked(ctx context.Context, mark string, limit int) ([]str
 	return titles, nil
 }
 
-// Cleanup deletes unmarked stories first seen before t that have no task.
+// Cleanup deletes unread, unmarked stories first seen before t that have no task.
 func (s *Store) Cleanup(ctx context.Context, t time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM stories WHERE first_seen < ? AND mark = '' AND task_key = ''`, t)
+		`DELETE FROM stories WHERE first_seen < ? AND mark = '' AND task_key = '' AND read_at IS NULL`, t)
 	if err != nil {
 		return 0, fmt.Errorf("cleanup: %w", err)
 	}

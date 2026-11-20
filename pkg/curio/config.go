@@ -24,7 +24,7 @@ type Config struct {
 	DataDir  string        `yaml:"data_dir"`  // folder for the SQLite database
 	Interval time.Duration `yaml:"interval"`  // time between front page refreshes
 	FrontN   int           `yaml:"front_n"`   // number of front page stories to read
-	KeepDays int           `yaml:"keep_days"` // unmarked stories older than this are deleted
+	KeepDays int           `yaml:"keep_days"` // unread, unmarked stories older than this are deleted
 	Days     int           `yaml:"days"`      // the list shows stories first seen in this many days
 	Cutoff   float64       `yaml:"cutoff"`    // default fit cutoff for clients
 	Extract  bool          `yaml:"extract"`   // fetch article text for the scorer

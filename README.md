@@ -103,12 +103,34 @@ into later prompts as `past_picks` and `past_rejects`.
 
 | Method | Path | Body or query |
 | --- | --- | --- |
-| GET | `/api/v1/stories` | `min_fit` (0 to 1), `q`, `sort` (`fit`, `date`, `points`), `marks` (`all`, `hide`, `good`, `bad`), `limit` |
+| GET | `/api/v1/stories` | `min_fit` (0 to 1), `q`, `sort` (`fit`, `date`, `points`), `marks` (`all`, `hide`, `good`, `bad`), `read` (`all`, `unread`, `read`), `as_of`, `limit` (1 to 500, default 200), `after`, `client` |
 | GET | `/api/v1/stories/{id}` | Summary, the top three reasons and all criteria rows |
 | POST | `/api/v1/stories/{id}/mark` | `{"mark":"good"}`, `"bad"` or `"none"` |
 | POST | `/api/v1/stories/{id}/task` | `{"key":"PER-12"}` records a task made from the story |
+| POST | `/api/v1/stories/{id}/read` | `{"read":true}` or `false`: marks one story read or unread |
+| POST | `/api/v1/read` | `{"before":"<as_of>"}` reads every story first seen up to that time |
+| POST | `/api/v1/visit` | `{"client":"bb"}` records a visit; the answer has the end of the previous visit |
 | POST | `/api/v1/refresh` | `{}` starts a refresh; 429 within `min_refresh` |
 | GET | `/api/v1/status` | Refresh state |
+
+### Read state and pages
+
+- A story is read when you open it, mark it Good or Bad, or mark it read. It
+  keeps its first read time. Mark all read takes a time (the `as_of` of the
+  list), so a story that came later stays unread.
+- A visit is one `POST /api/v1/visit` of a client, such as `bb`. Calls less
+  than 30 minutes apart are one visit. With `client`, the list gives
+  `last_visit` (the end of the previous visit), `new` on each story that is
+  unread and first seen after it, and the `new` count of the stories at or
+  above `min_fit`. The first visit has no new stories.
+- The list comes in pages. `next` is the cursor: send it as `after` for the
+  next page; it is null on the last page. The cursor is a story, not a
+  position, so stories that leave the list do not shift the next page.
+- Send the `as_of` of the first page with each later page and each poll. Then
+  `read=unread` keeps the stories that you read after that time, so they do
+  not drop out while you read.
+- The cleanup (`keep_days`) never deletes a story that is read, marked or has a
+  task.
 
 The API is on the Unix socket only. Every call needs
 `Authorization: Bearer <api_token>`. The API also refuses a non-loopback
