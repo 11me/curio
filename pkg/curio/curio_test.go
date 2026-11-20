@@ -127,6 +127,11 @@ func TestStore_UpsertAndMarks(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, n)
 	require.NoError(t, st.SetMark(ctx, 3, MarkNone, t0))
+	// the Bad mark read story 3, and read stories stay
+	n, err = st.Cleanup(ctx, t0.Add(48*time.Hour))
+	require.NoError(t, err)
+	assert.Zero(t, n)
+	require.NoError(t, st.SetRead(ctx, 3, false, t0))
 	n, err = st.Cleanup(ctx, t0.Add(48*time.Hour))
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), n)

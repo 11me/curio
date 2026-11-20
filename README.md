@@ -103,12 +103,44 @@ into later prompts as `past_picks` and `past_rejects`.
 
 | Method | Path | Body or query |
 | --- | --- | --- |
-| GET | `/api/v1/stories` | `min_fit` (0 to 1), `q`, `sort` (`fit`, `date`, `points`), `marks` (`all`, `hide`, `good`, `bad`), `limit` |
+| GET | `/api/v1/stories` | `min_fit` (0 to 1), `q`, `sort` (`fit`, `date`, `points`), `marks` (`all`, `hide`, `good`, `bad`), `read` (`all`, `unread`, `read`), `as_of`, `limit` (1 to 500, default 200), `after`, `client` |
 | GET | `/api/v1/stories/{id}` | Summary, the top three reasons and all criteria rows |
 | POST | `/api/v1/stories/{id}/mark` | `{"mark":"good"}`, `"bad"` or `"none"` |
 | POST | `/api/v1/stories/{id}/task` | `{"key":"PER-12"}` records a task made from the story |
+| POST | `/api/v1/stories/{id}/read` | `{"read":true}` or `false`: marks one story read or unread |
+| POST | `/api/v1/read` | `{"before":"<as_of>","min_fit":0.5}` reads the unread stories that the list can show (see below) |
+| POST | `/api/v1/visit` | `{"client":"bb"}` records a visit; the answer has the end of the previous visit |
 | POST | `/api/v1/refresh` | `{}` starts a refresh; 429 within `min_refresh` |
 | GET | `/api/v1/status` | Refresh state |
+
+### Read state and pages
+
+- A story is read when you open it, mark it Good or Bad, or mark it read. It
+  keeps its first read time. Mark all read reads only the stories that the
+  list can show: first seen up to a time (the `as_of` of the newest list
+  answer), in the `days` of the list, and at or above `min_fit`. A story that
+  came later, a story below the cutoff and an older story stay unread, and
+  the cleanup removes them.
+- The `unread` and `new` counts of the list follow `min_fit`, as the list does.
+- A visit is one `POST /api/v1/visit` of a client, such as `bb`. Calls less
+  than 30 minutes apart are one visit. With `client`, the list gives
+  `last_visit` (the end of the previous visit), `new` on each story that is
+  unread and first seen after it, and the `new` count of the stories at or
+  above `min_fit`. The first visit has no new stories.
+- The list comes in pages. `next` is the cursor: send it as `after` for the
+  next page, with the same `sort`; it is null on the last page. The cursor
+  holds the sort values of the last story (fit or points, the post time and
+  the id), not a position. A refresh that changes the points or fit of that
+  story does not move the start of the next page, and stories that leave the
+  list do not shift it. A story whose place moved across the boundary can
+  come twice or come only on the next poll.
+- Send the `as_of` of the first page with each later page and each poll. Then
+  `read=unread` keeps the stories that you read after that time, so they do
+  not drop out while you read.
+- A database from an older build gets the new column on start. Stories that
+  were marked Good or Bad before count as read from their mark time.
+- The cleanup (`keep_days`) never deletes a story that is read, marked or has a
+  task.
 
 The API is on the Unix socket only. Every call needs
 `Authorization: Bearer <api_token>`. The API also refuses a non-loopback
