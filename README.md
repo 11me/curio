@@ -126,7 +126,8 @@ into later prompts as `past_picks` and `past_rejects`.
   `above` counts the stories at or above `min_fit`, read or not. `below`
   counts the scored stories below `min_fit` that pass the other filters.
 - Undo of Mark all read finds its stories by the `read_at` of the answer, so a
-  story read at another time stays read.
+  story read at another time stays read. A story marked Good or Bad after Mark
+  all read also stays read.
 - A visit is one `POST /api/v1/visit` of a client, such as `bb`. Calls less
   than 30 minutes apart are one visit. With `client`, the list gives
   `last_visit` (the end of the previous visit), `new` on each story that is
