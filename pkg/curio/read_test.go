@@ -351,12 +351,15 @@ func TestAPI_UndoMarkAllRead(t *testing.T) {
 	assert.Equal(t, []any{float64(1), float64(3)}, out["ids"], "the ids of the stories that the call read")
 	assert.Equal(t, "2026-11-19T13:05:00Z", out["read_at"])
 
+	// story 3 is marked Good after Mark all read: the undo keeps it read with its mark
+	now = t0.Add(68 * time.Minute)
+	do(t, h, http.MethodPost, "/api/v1/stories/3/mark", `{"mark":"good"}`, nil)
 	now = t0.Add(70 * time.Minute)
 	rec, out = do(t, h, http.MethodPost, "/api/v1/read/undo", `{"read_at":"2026-11-19T13:05:00Z"}`, nil)
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.InDelta(t, 2, out["unread"], 0)
+	assert.InDelta(t, 1, out["unread"], 0)
 	_, out = do(t, h, http.MethodGet, "/api/v1/stories?read=unread", "", nil)
-	assert.Equal(t, []float64{1, 3}, ids(out), "story 2 stays read")
+	assert.Equal(t, []float64{1}, ids(out), "story 2 stays read; story 3 was marked after Mark all read")
 
 	// nothing to read gives an empty list, not null
 	_, out = do(t, h, http.MethodPost, "/api/v1/read", `{"before":"2026-11-19T12:00:00Z","min_fit":0.99}`, nil)
